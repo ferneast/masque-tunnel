@@ -1,27 +1,74 @@
-# masque-server
+# masque-tunnel
 
-Minimal MASQUE CONNECT-UDP (RFC 9298) proxy server powered by [tokio-quiche](https://github.com/cloudflare/quiche/tree/master/tokio-quiche).
+A high-performance MASQUE CONNECT-UDP (RFC 9298) tunnel — both client and server in a single binary.
 
-Tunnels UDP traffic through HTTP/3 (QUIC) on port 443, making it indistinguishable from normal HTTPS traffic.
+Tunnels UDP traffic through HTTP/3 (QUIC) DATAGRAM frames on port 443, making it indistinguishable from normal HTTPS traffic. Designed for use as a VPN obfuscation layer (e.g., tunneling WireGuard).
 
-## Usage
+## Features
+
+- **RFC 9298 compliant** — CONNECT-UDP over HTTP/3 with QUIC DATAGRAM frames
+- **Client + Server** — single binary with `client` / `server` subcommands
+- **High throughput** — BBR2 congestion control, batched I/O, zero-copy forwarding
+- **Obfuscation** — traffic appears as standard HTTPS/QUIC on port 443
+- **Authentication** — optional Bearer token for client verification
+- **SNI override** — supports domain fronting via custom TLS SNI
+- **Auto-reconnect** — client automatically reconnects with exponential backoff
+- **Static binaries** — musl-linked, runs on any Linux (including RouterOS containers)
+
+## Quick Start
+
+### Server
 
 ```bash
-masque-server \
-  --listen 0.0.0.0:443 \
+masque-tunnel server \
+  --listen [::]:443 \
   --cert cert.pem \
   --key key.pem \
   --auth-token your-secret-token
 ```
 
-### Options
+### Client
 
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--listen` | Listen address (ip:port) | `0.0.0.0:443` |
-| `--cert` | Path to TLS certificate (PEM) | required |
-| `--key` | Path to TLS private key (PEM) | required |
-| `--auth-token` | Optional Bearer token for authentication | none |
+```bash
+masque-tunnel client \
+  --listen 127.0.0.1:51820 \
+  --proxy-url https://your-server.com \
+  --target 10.0.0.1:51820 \
+  --auth-token your-secret-token
+```
+
+This creates a local UDP endpoint at `127.0.0.1:51820` that tunnels all traffic through the MASQUE proxy to `10.0.0.1:51820`.
+
+## Usage
+
+```
+masque-tunnel <COMMAND>
+
+Commands:
+  client  Run as MASQUE CONNECT-UDP client
+  server  Run as MASQUE CONNECT-UDP proxy server
+```
+
+### Client Options
+
+| Flag | Short | Description | Required |
+|------|-------|-------------|----------|
+| `--listen` | `-l` | Local UDP listen address | yes |
+| `--proxy-url` | `-p` | MASQUE proxy server URL | yes |
+| `--target` | `-t` | Target UDP endpoint (host:port) | yes |
+| `--sni` | | TLS SNI override for domain fronting | no |
+| `--auth-token` | | Bearer token for authentication | no |
+
+### Server Options
+
+| Flag | Short | Description | Default |
+|------|-------|-------------|---------|
+| `--listen` | `-l` | Listen address | `[::]:443` |
+| `--cert` | | TLS certificate PEM file | required |
+| `--key` | | TLS private key PEM file | required |
+| `--auth-token` | | Required Bearer token | none |
+
+## Deployment
 
 ### TLS Certificate
 
@@ -45,14 +92,14 @@ sudo ufw allow 443/udp
 ### systemd Service
 
 ```ini
-# /etc/systemd/system/masque-server.service
+# /etc/systemd/system/masque-tunnel.service
 [Unit]
-Description=MASQUE CONNECT-UDP Proxy
+Description=MASQUE CONNECT-UDP Tunnel
 After=network.target
 
 [Service]
-ExecStart=/usr/local/bin/masque-server \
-  --listen 0.0.0.0:443 \
+ExecStart=/usr/local/bin/masque-tunnel server \
+  --listen [::]:443 \
   --cert /etc/letsencrypt/live/your-domain.com/fullchain.pem \
   --key /etc/letsencrypt/live/your-domain.com/privkey.pem \
   --auth-token your-secret-token
@@ -70,15 +117,39 @@ WantedBy=multi-user.target
 cargo build --release
 ```
 
-## Protocol
+The release binary is statically linked (musl) and optimized with LTO.
 
-The server implements RFC 9298 CONNECT-UDP:
+## Architecture
 
-1. Client establishes QUIC connection to server on port 443
-2. Client sends HTTP/3 `CONNECT` request with `:protocol: connect-udp`
-3. Path format: `/.well-known/masque/udp/{target_host}/{target_port}/`
-4. Server responds `200` and creates a UDP socket to the target
-5. Bidirectional forwarding: QUIC DATAGRAM frames ↔ UDP packets
+```
+src/
+├── main.rs      # CLI entry point (clap subcommands)
+├── client.rs    # QUIC/H3 client: local UDP ↔ MASQUE DATAGRAM
+├── server.rs    # QUIC/H3 server: MASQUE DATAGRAM ↔ target UDP
+└── common.rs    # Shared: varint codec, flush, constants
+```
+
+### Protocol Flow
+
+```
+WireGuard ──UDP──▶ masque-tunnel client ──QUIC/H3──▶ masque-tunnel server ──UDP──▶ WireGuard
+           (local)                        (port 443)                        (target)
+```
+
+1. Client binds a local UDP socket and accepts WireGuard packets
+2. Establishes QUIC connection to the proxy server (port 443)
+3. Sends HTTP/3 extended CONNECT request (`:protocol: connect-udp`)
+4. Path: `/.well-known/masque/udp/{target_host}/{target_port}/`
+5. Server responds `200` and creates a UDP socket to the target
+6. Bidirectional forwarding via QUIC DATAGRAM frames (RFC 9297)
+
+### Performance Optimizations
+
+- **BBR2** congestion control (vs default Reno)
+- **Batched I/O** — up to 64 packets per event loop iteration via `try_recv_from`
+- **Pre-allocated buffers** — zero per-packet heap allocation in the forwarding path
+- **Async target readers** — spawned tokio tasks for target→client direction
+- **Non-blocking forwarding** — `try_send` / `try_send_to` on data path
 
 ## License
 

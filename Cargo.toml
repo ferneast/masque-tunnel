@@ -1,16 +1,34 @@
 [package]
-name = "masque-server"
-version = "0.1.0"
+name = "masque-tunnel"
+version = "0.9.3"
 edition = "2021"
+description = "MASQUE CONNECT-UDP tunnel (RFC 9298)"
+
+[lib]
+name = "masque_tunnel"
+path = "src/lib.rs"
 
 [[bin]]
-name = "masque-server"
+name = "masque-tunnel"
 path = "src/main.rs"
 
 [dependencies]
-tokio-quiche = "0.16"
+quinn = "0.11"
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+http = "1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2"
 tokio = { version = "1", features = ["net", "sync", "time", "rt-multi-thread", "macros"] }
-futures = "0.3"
-tracing = { version = "0.1", features = ["log"] }
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
+bytes = "1"
+url = "2"
+log = "0.4"
+
+[profile.release]
+lto = "fat"
+panic = "abort"
+codegen-units = 1
+opt-level = 3
+debug = 0
+strip = "symbols"
