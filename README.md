@@ -111,6 +111,34 @@ AmbientCapabilities=CAP_NET_BIND_SERVICE
 WantedBy=multi-user.target
 ```
 
+## Apple Platform Integration
+
+On Apple platforms (iOS / macOS / tvOS), you can use `NWConnection` with `ProxyConfiguration` to route UDP traffic through the MASQUE proxy natively — no client binary needed.
+
+```swift
+import Network
+
+let proxyUrl = URL(string: "https://your-server.com")!
+let parameters = NWParameters.udp
+
+let relayHop = ProxyConfiguration.RelayHop(
+    http3RelayEndpoint: .url(proxyUrl),
+    additionalHTTPHeaderFields: ["proxy-authorization": "your-secret-token"]
+)
+let proxyConfig = ProxyConfiguration(relayHops: [relayHop])
+let privacyContext = NWParameters.PrivacyContext(description: "MASQUE proxy")
+privacyContext.proxyConfigurations = [proxyConfig]
+parameters.setPrivacyContext(privacyContext)
+
+let connection = NWConnection(host: "10.0.0.1", port: 51820, using: parameters)
+connection.stateUpdateHandler = { state in
+    print("Connection state: \(state)")
+}
+connection.start(queue: .global(qos: .userInitiated))
+```
+
+The system's Network framework handles the HTTP/3 CONNECT-UDP handshake, QUIC transport, and DATAGRAM framing automatically. All UDP packets sent through this `NWConnection` will be tunneled via the MASQUE proxy to the specified target endpoint.
+
 ## Build from Source
 
 ```bash
