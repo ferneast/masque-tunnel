@@ -104,7 +104,7 @@ ExecStart=/usr/local/bin/masque-tunnel server \
   --key /etc/letsencrypt/live/your-domain.com/privkey.pem \
   --auth-token your-secret-token
 Restart=always
-User=masque
+User=root
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 
 [Install]
