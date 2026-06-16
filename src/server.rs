@@ -215,21 +215,26 @@ async fn handle_request(
         }
     };
 
-    // Resolve and connect to target
-    let target_addr = match tokio::net::lookup_host(format!("{host}:{port}")).await {
-        Ok(mut addrs) => match addrs.next() {
-            Some(a) => a,
-            None => {
+    // Resolve and connect to target. IP literals (including percent-decoded
+    // IPv6) are used directly; only hostnames go through DNS resolution.
+    let target_addr = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        SocketAddr::new(ip, port)
+    } else {
+        match tokio::net::lookup_host(format!("{host}:{port}")).await {
+            Ok(mut addrs) => match addrs.next() {
+                Some(a) => a,
+                None => {
+                    let resp = http::Response::builder().status(502).body(()).unwrap();
+                    let _ = stream.send_response(resp).await;
+                    return;
+                }
+            },
+            Err(e) => {
+                log::error!("[server] DNS error for {host}:{port}: {e}");
                 let resp = http::Response::builder().status(502).body(()).unwrap();
                 let _ = stream.send_response(resp).await;
                 return;
             }
-        },
-        Err(e) => {
-            log::error!("[server] DNS error for {host}:{port}: {e}");
-            let resp = http::Response::builder().status(502).body(()).unwrap();
-            let _ = stream.send_response(resp).await;
-            return;
         }
     };
 

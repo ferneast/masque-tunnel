@@ -71,7 +71,62 @@ pub fn decode_datagram(buf: &[u8]) -> Option<(u64, &[u8])> {
     Some((stream_id, &remaining[ctx_len..]))
 }
 
+/// Percent-decode an ASCII URI component (RFC 3986). Invalid `%` escapes are
+/// left untouched. Used to recover the target host from a CONNECT-UDP path,
+/// where IPv6 literals arrive with their colons encoded as `%3A` (RFC 9298).
+pub fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                out.push(hi * 16 + lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_val(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Encode a target host for use as a CONNECT-UDP path segment (RFC 9298).
+///
+/// IPv6 literal brackets are dropped and reserved characters (notably the
+/// IPv6 colon) are percent-encoded, so `[2a14::1]` becomes `2a14%3A%3A1`.
+pub fn encode_target_host(host: &str) -> String {
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    let mut out = String::with_capacity(bare.len());
+    for &b in bare.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 /// Parse a CONNECT-UDP path `/.well-known/masque/udp/{host}/{port}/` into (host, port).
+///
+/// The host is percent-decoded (RFC 9298 encodes IPv6 literal colons as `%3A`)
+/// and any surrounding brackets are stripped, so callers receive a bare host or
+/// IP literal ready for connection.
 pub fn parse_connect_udp_path(path: &str) -> Option<(String, u16)> {
     let prefix = format!("{}/", CONNECT_UDP_PATH);
     let stripped = path.strip_prefix(&prefix)?;
@@ -82,5 +137,95 @@ pub fn parse_connect_udp_path(path: &str) -> Option<(String, u16)> {
     if host.is_empty() {
         return None;
     }
-    Some((host.to_string(), port))
+    let mut host = percent_decode(host);
+    // Tolerate clients that send bracketed IPv6 literals (RFC 9298 omits the
+    // brackets, but bracketed forms are common in the wild).
+    if host.starts_with('[') && host.ends_with(']') {
+        host = host[1..host.len() - 1].to_string();
+    }
+    if host.is_empty() {
+        return None;
+    }
+    Some((host, port))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn p(path: &str) -> Option<(String, u16)> {
+        parse_connect_udp_path(path)
+    }
+
+    #[test]
+    fn parses_ipv4() {
+        assert_eq!(
+            p("/.well-known/masque/udp/192.0.2.6/443/"),
+            Some(("192.0.2.6".into(), 443))
+        );
+    }
+
+    #[test]
+    fn parses_hostname() {
+        assert_eq!(
+            p("/.well-known/masque/udp/example.com/443/"),
+            Some(("example.com".into(), 443))
+        );
+    }
+
+    #[test]
+    fn parses_percent_encoded_ipv6() {
+        // RFC 9298 form: colons encoded as %3A, no brackets.
+        // Address from the RFC 3849 documentation prefix (2001:db8::/32).
+        assert_eq!(
+            p("/.well-known/masque/udp/2001%3Adb8%3A101%3A1228%3A%3A4d23/29381/"),
+            Some(("2001:db8:101:1228::4d23".into(), 29381))
+        );
+        assert_eq!(
+            p("/.well-known/masque/udp/2001%3Adb8%3A%3A42/443/"),
+            Some(("2001:db8::42".into(), 443))
+        );
+    }
+
+    #[test]
+    fn parses_bracketed_ipv6() {
+        // Lenient: some clients send the bracketed literal unencoded.
+        assert_eq!(
+            p("/.well-known/masque/udp/[2001:db8:101:1228::4d23]/29381/"),
+            Some(("2001:db8:101:1228::4d23".into(), 29381))
+        );
+    }
+
+    #[test]
+    fn decoded_ipv6_parses_as_ip() {
+        let (host, _) =
+            p("/.well-known/masque/udp/2001%3Adb8%3A101%3A1228%3A%3A4d23/29381/").unwrap();
+        assert!(host.parse::<std::net::IpAddr>().is_ok());
+    }
+
+    #[test]
+    fn encode_target_host_ipv6() {
+        assert_eq!(
+            encode_target_host("[2001:db8:101:1228::4d23]"),
+            "2001%3Adb8%3A101%3A1228%3A%3A4d23"
+        );
+        assert_eq!(encode_target_host("192.0.2.6"), "192.0.2.6");
+        assert_eq!(encode_target_host("example.com"), "example.com");
+    }
+
+    #[test]
+    fn encode_decode_roundtrip_ipv6() {
+        let host = "[2001:db8:101:1228::4d23]";
+        let enc = encode_target_host(host);
+        let path = format!("{CONNECT_UDP_PATH}/{enc}/29381/");
+        assert_eq!(
+            parse_connect_udp_path(&path),
+            Some(("2001:db8:101:1228::4d23".into(), 29381))
+        );
+    }
+
+    #[test]
+    fn rejects_missing_port() {
+        assert_eq!(p("/.well-known/masque/udp/example.com/"), None);
+    }
 }

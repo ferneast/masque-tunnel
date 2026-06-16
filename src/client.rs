@@ -163,8 +163,10 @@ async fn run_tunnel_inner(
         let _ = driver.wait_idle().await;
     });
 
-    // Build CONNECT-UDP request (RFC 9298)
-    let path = format!("{CONNECT_UDP_PATH}/{target_host}/{target_port}/");
+    // Build CONNECT-UDP request (RFC 9298). The target host is percent-encoded
+    // so IPv6 literals (colons -> %3A, brackets dropped) form a valid path segment.
+    let encoded_host = encode_target_host(target_host);
+    let path = format!("{CONNECT_UDP_PATH}/{encoded_host}/{target_port}/");
     let uri: http::Uri = format!("https://{proxy_host}{path}").parse()?;
     let protocol: h3::ext::Protocol = "connect-udp"
         .parse()
