@@ -1,7 +1,10 @@
-# Used by CI to package pre-built static binaries into a multi-arch image.
+# Used by CI to package pre-built glibc binaries into a multi-arch image.
 # For local builds, use the regular Dockerfile instead.
-FROM scratch
+#
+# The binary links glibc dynamically (BoringSSL is static), so the runtime
+# base is debian-slim, not scratch.
+FROM debian:bookworm-slim
 ARG TARGETARCH
-COPY build/linux/${TARGETARCH}/masque-tunnel /masque-tunnel
+COPY build/linux/${TARGETARCH}/masque-tunnel /usr/local/bin/masque-tunnel
 EXPOSE 443/udp
-ENTRYPOINT ["/masque-tunnel"]
+ENTRYPOINT ["/usr/local/bin/masque-tunnel"]

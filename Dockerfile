@@ -1,20 +1,26 @@
-# Stage 1: Build static binary
-FROM rust:1-alpine AS builder
+# Stage 1: build. quiche / tokio-quiche compile BoringSSL from source, so a
+# C/C++ toolchain and CMake are required. The binary links glibc dynamically.
+FROM rust:1-bookworm AS builder
 
-RUN apk add --no-cache musl-dev
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends cmake clang \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml ./
 COPY src/ src/
 
-RUN cargo build --release --target $(uname -m)-unknown-linux-musl \
-    && cp target/$(uname -m)-unknown-linux-musl/release/masque-tunnel /masque-tunnel
+RUN cargo build --release && cp target/release/masque-tunnel /masque-tunnel
 
-# Stage 2: Minimal runtime image
-FROM scratch
+# Stage 2: minimal glibc runtime. BoringSSL is statically linked into the
+# binary, so only glibc + libgcc are needed at runtime — not a static binary,
+# so `scratch` no longer works.
+FROM debian:bookworm-slim
 
-COPY --from=builder /masque-tunnel /masque-tunnel
+COPY --from=builder /masque-tunnel /usr/local/bin/masque-tunnel
 
 EXPOSE 443/udp
 
-ENTRYPOINT ["/masque-tunnel"]
+# CONNECT-IP needs a TUN device: run with
+#   --cap-add NET_ADMIN --device /dev/net/tun
+ENTRYPOINT ["/usr/local/bin/masque-tunnel"]
