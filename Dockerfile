@@ -7,10 +7,11 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
-COPY Cargo.toml ./
+COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
 
-RUN cargo build --release && cp target/release/masque-tunnel /masque-tunnel
+# --locked: build exactly the committed Cargo.lock for reproducibility.
+RUN cargo build --release --locked && cp target/release/masque-tunnel /masque-tunnel
 
 # Stage 2: minimal glibc runtime. BoringSSL is statically linked into the
 # binary, so only glibc + libgcc are needed at runtime — not a static binary,
