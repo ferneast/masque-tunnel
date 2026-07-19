@@ -294,6 +294,14 @@ pub fn init(config: &IpConfig) -> Result<Arc<IpTunState>, Box<dyn std::error::Er
             match st.tun.recv(&mut buf).await {
                 Ok(n) => {
                     let pkt = &buf[..n];
+                    // Oversized for one datagram: reply ICMP Packet Too Big to
+                    // the source (RFC 9484 §7.1) instead of dropping silently.
+                    if n as u32 > TUNNEL_IP_MTU {
+                        if let Some(icmp) = crate::icmp::packet_too_big(pkt, TUNNEL_IP_MTU) {
+                            let _ = st.tun.try_send(&icmp);
+                        }
+                        continue;
+                    }
                     let Some(dst) = packet_dst(pkt) else { continue };
                     let flow = { st.routes.read().unwrap().get(&dst).cloned() };
                     let Some(mut flow) = flow else { continue };

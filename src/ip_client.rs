@@ -229,6 +229,17 @@ async fn run_tunnel(
                 return Err(format!("TUN recv error: {e}").into());
             }
             Event::Tun(Ok(n)) => {
+                // Oversized for one datagram: reply ICMP Packet Too Big so the
+                // local source lowers its MTU, instead of dropping it silently
+                // (RFC 9484 §7.1).
+                if n as u32 > TUNNEL_IP_MTU {
+                    if let Some(icmp) = crate::icmp::packet_too_big(&pkt_buf[..n], TUNNEL_IP_MTU) {
+                        if let Some(b) = tun.as_ref() {
+                            let _ = b.dev.try_send(&icmp);
+                        }
+                    }
+                    continue;
+                }
                 let body = encode_context_payload(0, &pkt_buf[..n]);
                 if flow_send
                     .send(OutboundFrame::Datagram(DgramBuffer::from_slice(&body), flow_id))

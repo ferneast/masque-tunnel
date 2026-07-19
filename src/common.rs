@@ -6,6 +6,13 @@ pub const CONNECT_UDP_PATH: &str = "/.well-known/masque/udp";
 /// Well-known URI prefix for CONNECT-IP (RFC 9484).
 pub const CONNECT_IP_PATH: &str = "/.well-known/masque/ip";
 
+/// Largest inner IP packet one HTTP Datagram can carry before we reply with an
+/// ICMP Packet Too Big (RFC 9484 §7.1). Kept below the datagram payload
+/// available at the default ~1350-byte max UDP payload (leaving room for QUIC,
+/// DATAGRAM-frame, quarter-stream-id, and context-id overhead) and at/above
+/// the IPv6 minimum MTU of 1280.
+pub const TUNNEL_IP_MTU: u32 = 1300;
+
 /// Append a QUIC variable-length integer (RFC 9000, Section 16) to a buffer.
 pub fn put_varint(buf: &mut BytesMut, value: u64) {
     if value < 64 {
