@@ -1,7 +1,10 @@
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{BufMut, BytesMut};
 
 /// Well-known URI prefix for CONNECT-UDP (RFC 9298).
 pub const CONNECT_UDP_PATH: &str = "/.well-known/masque/udp";
+
+/// Well-known URI prefix for CONNECT-IP (RFC 9484).
+pub const CONNECT_IP_PATH: &str = "/.well-known/masque/ip";
 
 /// Append a QUIC variable-length integer (RFC 9000, Section 16) to a buffer.
 pub fn put_varint(buf: &mut BytesMut, value: u64) {
@@ -51,24 +54,24 @@ pub fn decode_varint(buf: &[u8]) -> Option<(u64, usize)> {
     Some((value, len))
 }
 
-/// Encode a DATAGRAM payload with Quarter Stream ID and Context ID = 0.
-/// Returns Bytes via BytesMut::freeze (single allocation, O(1) handoff).
-pub fn encode_datagram(stream_id: u64, payload: &[u8]) -> Bytes {
-    // QSID varint is at most 8 bytes; context id is 1 byte; rest is payload.
-    let mut buf = BytesMut::with_capacity(9 + payload.len());
-    put_varint(&mut buf, stream_id / 4);
-    buf.put_u8(0x00); // Context ID = 0
+/// Prepend the RFC 9298/9484 context ID to a datagram body. tokio-quiche adds
+/// the RFC 9297 quarter-stream-id itself, so the body we hand it is just
+/// `Context ID (varint) | Payload`. Context ID 0 carries the proxied payload.
+pub fn encode_context_payload(context_id: u64, payload: &[u8]) -> Vec<u8> {
+    let mut buf = BytesMut::with_capacity(8 + payload.len());
+    put_varint(&mut buf, context_id);
     buf.put_slice(payload);
-    buf.freeze()
+    buf.to_vec()
 }
 
-/// Decode a DATAGRAM payload. Returns (stream_id, udp_payload).
-pub fn decode_datagram(buf: &[u8]) -> Option<(u64, &[u8])> {
-    let (qsid, qsid_len) = decode_varint(buf)?;
-    let stream_id = qsid * 4;
-    let remaining = &buf[qsid_len..];
-    let (_, ctx_len) = decode_varint(remaining)?;
-    Some((stream_id, &remaining[ctx_len..]))
+/// Split a received datagram body into (context_id, payload).
+///
+/// Both RFC 9298 and RFC 9484 reserve Context ID 0 for the actual proxied
+/// payload; callers must drop datagrams with any other context ID instead of
+/// forwarding them.
+pub fn decode_context_payload(buf: &[u8]) -> Option<(u64, &[u8])> {
+    let (context_id, n) = decode_varint(buf)?;
+    Some((context_id, &buf[n..]))
 }
 
 /// Percent-decode an ASCII URI component (RFC 3986). Invalid `%` escapes are
@@ -149,6 +152,24 @@ pub fn parse_connect_udp_path(path: &str) -> Option<(String, u16)> {
     Some((host, port))
 }
 
+/// Parse a CONNECT-IP path `/.well-known/masque/ip/{target}/{ipproto}/` into
+/// its percent-decoded (target, ipproto) segments (RFC 9484 §4.1).
+///
+/// Both variables may be the wildcard `*`. Validation of scoped targets and
+/// protocol numbers is left to the caller; this only recovers the segments.
+pub fn parse_connect_ip_path(path: &str) -> Option<(String, String)> {
+    let prefix = format!("{}/", CONNECT_IP_PATH);
+    let stripped = path.strip_prefix(&prefix)?;
+    let stripped = stripped.strip_suffix('/').unwrap_or(stripped);
+    let mut parts = stripped.split('/');
+    let target = parts.next()?;
+    let ipproto = parts.next()?;
+    if parts.next().is_some() || target.is_empty() || ipproto.is_empty() {
+        return None;
+    }
+    Some((percent_decode(target), percent_decode(ipproto)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,5 +248,50 @@ mod tests {
     #[test]
     fn rejects_missing_port() {
         assert_eq!(p("/.well-known/masque/udp/example.com/"), None);
+    }
+
+    #[test]
+    fn parses_connect_ip_wildcards() {
+        assert_eq!(
+            parse_connect_ip_path("/.well-known/masque/ip/*/*/"),
+            Some(("*".into(), "*".into()))
+        );
+        // Trailing slash is optional in the wild.
+        assert_eq!(
+            parse_connect_ip_path("/.well-known/masque/ip/*/*"),
+            Some(("*".into(), "*".into()))
+        );
+    }
+
+    #[test]
+    fn parses_connect_ip_scoped_target() {
+        assert_eq!(
+            parse_connect_ip_path("/.well-known/masque/ip/2001%3Adb8%3A%3A42%2F64/17/"),
+            Some(("2001:db8::42/64".into(), "17".into()))
+        );
+    }
+
+    #[test]
+    fn rejects_connect_ip_bad_paths() {
+        assert_eq!(parse_connect_ip_path("/.well-known/masque/ip/*/"), None);
+        assert_eq!(parse_connect_ip_path("/.well-known/masque/ip/*/*/x/"), None);
+        assert_eq!(parse_connect_ip_path("/.well-known/masque/udp/h/443/"), None);
+    }
+
+    #[test]
+    fn context_payload_roundtrip() {
+        let body = encode_context_payload(0, b"hello");
+        assert_eq!(body, vec![0x00, b'h', b'e', b'l', b'l', b'o']);
+        let (ctx, payload) = decode_context_payload(&body).unwrap();
+        assert_eq!(ctx, 0);
+        assert_eq!(payload, b"hello");
+    }
+
+    #[test]
+    fn context_payload_drops_nonzero_context() {
+        // Context ID 1 encodes as a single varint byte 0x01.
+        let (ctx, payload) = decode_context_payload(&[0x01, 0xaa, 0xbb]).unwrap();
+        assert_eq!(ctx, 1);
+        assert_eq!(payload, &[0xaa, 0xbb]);
     }
 }

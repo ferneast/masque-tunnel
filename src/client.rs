@@ -1,9 +1,31 @@
+//! CONNECT-UDP client (RFC 9298) on the quiche / tokio-quiche stack.
+//!
+//! Binds a local UDP socket and tunnels its traffic to the proxy over an
+//! HTTP/3 extended CONNECT with `:protocol = connect-udp`. The proxy path
+//! carries the target host/port; datagrams flow on the request's DATAGRAM
+//! flow with an RFC 9298 context ID of 0.
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::Bytes;
+use futures_util::SinkExt;
 use tokio::net::UdpSocket;
+use tokio::sync::{oneshot, Mutex};
+
+use tokio_quiche::datagram_socket::DgramBuffer;
+use tokio_quiche::http3::driver::{
+    ClientH3Event, H3Event, InboundFrame, InboundFrameStream, NewClientRequest, OutboundFrame,
+    OutboundFrameSender,
+};
+use boring::ssl::{SslContextBuilder, SslMethod, SslVerifyMode};
+use tokio_quiche::http3::settings::Http3Settings;
+use tokio_quiche::quic::ConnectionHook;
+use tokio_quiche::quiche::h3::{Header, NameValue};
+use tokio_quiche::settings::{
+    CertificateKind, ConnectionParams, Hooks, QuicSettings, TlsCertificatePaths,
+};
+use tokio_quiche::ClientH3Driver;
 
 use crate::common::*;
 
@@ -18,212 +40,249 @@ pub struct ClientConfig {
     pub ca: Option<String>,
 }
 
+/// Transport tuning shared by the CONNECT-UDP and CONNECT-IP clients.
+pub(crate) fn client_quic_settings(insecure: bool) -> QuicSettings {
+    let mut qs = QuicSettings::default();
+    qs.cc_algorithm = "bbr2".to_string();
+    qs.enable_dgram = true;
+    qs.dgram_recv_max_queue_len = 65_536;
+    qs.dgram_send_max_queue_len = 65_536;
+    qs.max_idle_timeout = Some(Duration::from_secs(30));
+    // verify_peer defaults to false in tokio-quiche; only enable it when the
+    // caller did not ask for --insecure. Custom-CA (--ca) support still needs
+    // a BoringSSL ConnectionHook and is handled by the caller.
+    qs.verify_peer = !insecure;
+    qs
+}
+
+/// A BoringSSL ConnectionHook that trusts a custom CA PEM (for `--ca`).
+struct CaHook {
+    ca_path: String,
+}
+
+impl ConnectionHook for CaHook {
+    fn create_custom_ssl_context_builder(
+        &self,
+        _settings: TlsCertificatePaths<'_>,
+    ) -> Option<SslContextBuilder> {
+        let mut b = SslContextBuilder::new(SslMethod::tls_client()).ok()?;
+        if let Err(e) = b.set_ca_file(&self.ca_path) {
+            log::error!("[client] failed to load --ca {}: {e}", self.ca_path);
+            return None;
+        }
+        b.set_verify(SslVerifyMode::PEER);
+        Some(b)
+    }
+}
+
+/// Build client connection params. With `--ca` a BoringSSL hook loads the
+/// custom CA and verifies the peer against it; with `--insecure` verification
+/// is off; otherwise the system trust store is used.
+pub(crate) fn build_client_params(insecure: bool, ca: &Option<String>) -> ConnectionParams<'_> {
+    let qs = client_quic_settings(insecure);
+    match ca {
+        Some(ca_path) if !insecure => {
+            let hooks = Hooks {
+                connection_hook: Some(std::sync::Arc::new(CaHook {
+                    ca_path: ca_path.clone(),
+                })),
+            };
+            // tls_cert must be Some to trigger the hook; the hook loads the CA
+            // itself and ignores these paths, so they are just placeholders.
+            let tls = TlsCertificatePaths {
+                cert: ca_path,
+                private_key: ca_path,
+                kind: CertificateKind::X509,
+            };
+            ConnectionParams::new_client(qs, Some(tls), hooks)
+        }
+        _ => ConnectionParams::new_client(qs, None, Hooks::default()),
+    }
+}
+
 /// Run the MASQUE CONNECT-UDP client with automatic reconnection.
 pub async fn run(config: ClientConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listen_addr: SocketAddr = config.listen.parse()?;
-
-    // Parse proxy URL
     let url = url::Url::parse(&config.proxy_url)?;
     let proxy_host = url.host_str().ok_or("missing host in proxy URL")?.to_string();
     let proxy_port = url.port().unwrap_or(443);
-    let sni = config.sni.unwrap_or_else(|| proxy_host.clone());
-
-    // Parse target
+    let sni = config.sni.clone().unwrap_or_else(|| proxy_host.clone());
     let (target_host, target_port) = parse_target(&config.target)?;
 
-    // Resolve proxy address
     let proxy_addr = tokio::net::lookup_host(format!("{proxy_host}:{proxy_port}"))
         .await?
         .next()
         .ok_or_else(|| format!("DNS resolution failed for {proxy_host}:{proxy_port}"))?;
 
-    // TLS config
-    let client_crypto = build_tls_config(&config.ca, config.insecure)?;
-
-    let mut transport = quinn::TransportConfig::default();
-    transport.initial_mtu(1350);
-    transport.datagram_receive_buffer_size(Some(8_000_000));
-    transport.datagram_send_buffer_size(8_000_000);
-    transport.max_idle_timeout(Some(
-        Duration::from_secs(30)
-            .try_into()
-            .map_err(|e| format!("{e}"))?,
-    ));
-    transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
-
-    let mut client_config = quinn::ClientConfig::new(Arc::new(
-        quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)?,
-    ));
-    client_config.transport_config(Arc::new(transport));
-
-    let bind_addr: SocketAddr = if proxy_addr.is_ipv4() {
-        "0.0.0.0:0".parse()?
-    } else {
-        "[::]:0".parse()?
-    };
-    let mut endpoint = quinn::Endpoint::client(bind_addr)?;
-    endpoint.set_default_client_config(client_config);
-
-    let local = UdpSocket::bind(listen_addr).await?;
+    let local = Arc::new(UdpSocket::bind(listen_addr).await?);
     log::info!(
         "[client] Listening on {listen_addr}, proxy={proxy_host}:{proxy_port}, target={target_host}:{target_port}"
     );
 
-    // Reconnection loop
     let mut backoff_ms = 500u64;
     loop {
-        log::info!("[client] Connecting to {proxy_addr}...");
-        let quinn_conn = match endpoint.connect(proxy_addr, &sni) {
-            Ok(connecting) => {
-                // Try 0-RTT first (requires a cached session ticket from a previous connection)
-                match connecting.into_0rtt() {
-                    Ok((conn, zero_rtt_accepted)) => {
-                        log::info!("[client] 0-RTT connection (early data)");
-                        tokio::spawn(async move {
-                            zero_rtt_accepted.await;
-                            log::info!("[client] 0-RTT accepted by server");
-                        });
-                        backoff_ms = 500;
-                        conn
-                    }
-                    Err(connecting) => match connecting.await {
-                        Ok(c) => {
-                            log::info!("[client] QUIC connected (full handshake)");
-                            backoff_ms = 500;
-                            c
-                        }
-                        Err(e) => {
-                            log::error!("[client] Connection failed: {e}");
-                            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                            backoff_ms = (backoff_ms * 2).min(30_000);
-                            continue;
-                        }
-                    },
-                }
-            }
-            Err(e) => {
-                log::error!("[client] Connect error: {e}");
-                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                backoff_ms = (backoff_ms * 2).min(30_000);
-                continue;
-            }
-        };
-
-        let err = run_tunnel(
-            &quinn_conn,
-            &local,
+        let outcome = run_tunnel(
+            &config,
             &proxy_host,
+            &sni,
+            proxy_addr,
+            &local,
             &target_host,
             target_port,
-            &config.auth_token,
         )
         .await;
-
-        log::warn!("[client] Connection lost: {err}, reconnecting in {backoff_ms}ms");
+        match outcome {
+            Ok(()) => log::warn!("[client] tunnel ended, reconnecting in {backoff_ms}ms"),
+            Err(e) => log::warn!("[client] connection lost: {e}, reconnecting in {backoff_ms}ms"),
+        }
         tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
         backoff_ms = (backoff_ms * 2).min(30_000);
     }
 }
 
 async fn run_tunnel(
-    quinn_conn: &quinn::Connection,
-    local: &UdpSocket,
+    config: &ClientConfig,
     proxy_host: &str,
+    sni: &str,
+    proxy_addr: SocketAddr,
+    local: &Arc<UdpSocket>,
     target_host: &str,
     target_port: u16,
-    auth_token: &Option<String>,
-) -> Box<dyn std::error::Error + Send + Sync> {
-    match run_tunnel_inner(quinn_conn, local, proxy_host, target_host, target_port, auth_token).await
-    {
-        Ok(()) => "tunnel ended".into(),
-        Err(e) => e,
-    }
-}
-
-async fn run_tunnel_inner(
-    quinn_conn: &quinn::Connection,
-    local: &UdpSocket,
-    proxy_host: &str,
-    target_host: &str,
-    target_port: u16,
-    auth_token: &Option<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Clone for datagram I/O — h3-quinn takes ownership of one clone
-    let dgram_conn = quinn_conn.clone();
+    let bind = if proxy_addr.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+    let qsock = UdpSocket::bind(bind).await?;
+    qsock.connect(proxy_addr).await?;
 
-    let h3_conn = h3_quinn::Connection::new(quinn_conn.clone());
-    let (mut driver, mut send_request) = h3::client::builder()
-        .enable_extended_connect(true)
-        .enable_datagram(true)
-        .build::<h3_quinn::Connection, h3_quinn::OpenStreams, Bytes>(h3_conn)
-        .await?;
+    let params = build_client_params(config.insecure, &config.ca);
+    let (driver, mut controller) = ClientH3Driver::new(Http3Settings::default());
+    let socket: tokio_quiche::socket::Socket<_, _> = qsock.try_into()?;
+    let _conn = tokio_quiche::quic::connect_with_config(socket, Some(sni), &params, driver).await?;
+    log::info!("[client] QUIC connected to {proxy_addr}");
 
-    // Spawn H3 driver to keep the connection alive
-    tokio::spawn(async move {
-        let _ = driver.wait_idle().await;
-    });
-
-    // Build CONNECT-UDP request (RFC 9298). The target host is percent-encoded
-    // so IPv6 literals (colons -> %3A, brackets dropped) form a valid path segment.
+    // Build the CONNECT-UDP request (RFC 9298). The target host is
+    // percent-encoded so IPv6 literals form a valid path segment.
     let encoded_host = encode_target_host(target_host);
     let path = format!("{CONNECT_UDP_PATH}/{encoded_host}/{target_port}/");
-    let uri: http::Uri = format!("https://{proxy_host}{path}").parse()?;
-    let protocol: h3::ext::Protocol = "connect-udp"
-        .parse()
-        .map_err(|_| "invalid protocol")?;
-
-    let mut req_builder = http::Request::builder()
-        .method("CONNECT")
-        .uri(uri)
-        .header("capsule-protocol", "?1");
-    if let Some(token) = auth_token {
-        req_builder = req_builder.header("proxy-authorization", format!("Bearer {token}"));
-    }
-    let req = req_builder.extension(protocol).body(())?;
-
-    let mut stream = send_request.send_request(req).await?;
-    let resp = stream.recv_response().await?;
-
-    if resp.status() != http::StatusCode::OK {
-        return Err(format!("CONNECT-UDP rejected: status {}", resp.status()).into());
+    let mut headers = vec![
+        Header::new(b":method", b"CONNECT"),
+        Header::new(b":protocol", b"connect-udp"),
+        Header::new(b":scheme", b"https"),
+        Header::new(b":authority", proxy_host.as_bytes()),
+        Header::new(b":path", path.as_bytes()),
+    ];
+    let auth_value;
+    if let Some(token) = &config.auth_token {
+        auth_value = format!("Bearer {token}");
+        headers.push(Header::new(b"proxy-authorization", auth_value.as_bytes()));
     }
 
-    // Use raw QUIC stream ID for DATAGRAM Quarter Stream ID encoding.
-    // index() returns quic_stream_id >> 2, but encode_datagram needs
-    // the full QUIC stream ID (it divides by 4 internally for QSID).
-    let h3_index = stream.id().index();
-    let quic_stream_id = h3_index * 4;
-    log::info!(
-        "[client] CONNECT-UDP established: h3_index={h3_index} quic_stream_id={quic_stream_id} target={target_host}:{target_port}"
-    );
+    // body_writer = Some sends the request without FIN so the stream (and its
+    // datagram flow) stays open for the tunnel's lifetime.
+    let (body_tx, body_rx) = oneshot::channel::<OutboundFrameSender>();
+    controller
+        .request_sender()
+        .send(NewClientRequest {
+            request_id: 1,
+            headers,
+            body_writer: Some(body_tx),
+        })
+        .map_err(|_| "failed to queue CONNECT-UDP request")?;
 
-    // Datagram forwarding loop
-    let mut peer_addr: Option<SocketAddr> = None;
-    let mut buf = [0u8; 2048];
-
-    loop {
-        tokio::select! {
-            result = local.recv_from(&mut buf) => {
-                let (n, src) = result?;
-                peer_addr = Some(src);
-                match dgram_conn.send_datagram(encode_datagram(quic_stream_id, &buf[..n])) {
-                    Ok(()) => {}
-                    Err(quinn::SendDatagramError::TooLarge) => {
-                        log::trace!("[client] drop oversized datagram: {n} bytes");
-                    }
-                    Err(e) => return Err(e.into()),
+    // Collect the datagram flow (NewFlow) and the 200 response before bridging.
+    let mut flow: Option<(OutboundFrameSender, InboundFrameStream, u64)> = None;
+    let mut status_ok = false;
+    while let Some(ev) = controller.event_receiver_mut().recv().await {
+        match ev {
+            ClientH3Event::Core(H3Event::NewFlow {
+                flow_id,
+                send,
+                recv,
+            }) => flow = Some((send, recv, flow_id)),
+            ClientH3Event::Core(H3Event::IncomingHeaders(h)) => {
+                let status = h
+                    .headers
+                    .iter()
+                    .find(|x| x.name() == b":status")
+                    .map(|x| x.value().to_vec());
+                status_ok = status.as_deref() == Some(b"200");
+                if !status_ok {
+                    return Err(format!(
+                        "CONNECT-UDP rejected: :status={}",
+                        status
+                            .map(|s| String::from_utf8_lossy(&s).into_owned())
+                            .unwrap_or_else(|| "(none)".into())
+                    )
+                    .into());
                 }
             }
-            result = dgram_conn.read_datagram() => {
-                let data = result?;
-                if let Some((_, payload)) = decode_datagram(&data) {
-                    if let Some(addr) = peer_addr {
-                        local.send_to(payload, addr).await?;
-                    }
+            ClientH3Event::Core(H3Event::ConnectionError(e)) => {
+                return Err(format!("connection error: {e}").into())
+            }
+            ClientH3Event::Core(H3Event::ConnectionShutdown(_)) => {
+                return Err("connection shut down before tunnel came up".into())
+            }
+            _ => {}
+        }
+        if flow.is_some() && status_ok {
+            break;
+        }
+    }
+
+    let (flow_send, flow_recv, flow_id) =
+        flow.ok_or("proxy never opened a datagram flow")?;
+    log::info!(
+        "[client] CONNECT-UDP established (flow_id={flow_id}) target={target_host}:{target_port}"
+    );
+
+    // Park the request-stream sender so the driver never tears the stream down.
+    let _keepalive = body_rx.await.ok();
+
+    bridge_local_udp(local.clone(), flow_send, flow_recv, flow_id).await;
+    drop(controller);
+    Ok(())
+}
+
+/// Bridge the local UDP socket to the tunnel's datagram flow. Tracks the most
+/// recent local peer so replies from the tunnel go back to the right sender.
+async fn bridge_local_udp(
+    local: Arc<UdpSocket>,
+    mut flow_send: OutboundFrameSender,
+    mut flow_recv: InboundFrameStream,
+    flow_id: u64,
+) {
+    let peer: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
+
+    let local_rx = local.clone();
+    let peer_w = peer.clone();
+    let up = tokio::spawn(async move {
+        let mut buf = vec![0u8; 65535];
+        while let Ok((n, src)) = local_rx.recv_from(&mut buf).await {
+            *peer_w.lock().await = Some(src);
+            let body = encode_context_payload(0, &buf[..n]);
+            if flow_send
+                .send(OutboundFrame::Datagram(DgramBuffer::from_slice(&body), flow_id))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    let down = tokio::spawn(async move {
+        while let Some(frame) = flow_recv.recv().await {
+            let InboundFrame::Datagram(buf) = frame else {
+                continue;
+            };
+            if let Some((0, payload)) = decode_context_payload(buf.as_slice()) {
+                if let Some(dst) = *peer.lock().await {
+                    let _ = local.send_to(payload, dst).await;
                 }
             }
         }
-    }
+    });
+
+    let _ = tokio::join!(up, down);
 }
 
 fn parse_target(addr: &str) -> Result<(String, u16), String> {
@@ -239,72 +298,5 @@ fn parse_target(addr: &str) -> Result<(String, u16), String> {
         }
         let port: u16 = parts[0].parse().map_err(|e| format!("Invalid port: {e}"))?;
         Ok((parts[1].to_string(), port))
-    }
-}
-
-fn build_tls_config(
-    ca: &Option<String>,
-    insecure: bool,
-) -> Result<rustls::ClientConfig, Box<dyn std::error::Error + Send + Sync>> {
-    let mut config = if insecure {
-        rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
-            .with_no_client_auth()
-    } else if let Some(ca_path) = ca {
-        let file = std::fs::File::open(ca_path)?;
-        let mut reader = std::io::BufReader::new(file);
-        let mut roots = rustls::RootCertStore::empty();
-        for cert in rustls_pemfile::certs(&mut reader) {
-            roots.add(cert?)?;
-        }
-        rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth()
-    } else {
-        return Err("either --insecure or --ca must be specified".into());
-    };
-    config.alpn_protocols = vec![b"h3".to_vec()];
-    config.enable_early_data = true;
-    Ok(config)
-}
-
-#[derive(Debug)]
-struct SkipServerVerification;
-
-impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::aws_lc_rs::default_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
     }
 }

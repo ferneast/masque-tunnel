@@ -1,13 +1,29 @@
+//! MASQUE proxy server on the quiche / tokio-quiche stack.
+//!
+//! Accepts HTTP/3 extended CONNECT requests. CONNECT-UDP (RFC 9298) is served
+//! here; CONNECT-IP (RFC 9484) dispatch is added in `ip_server`.
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
-use bytes::Bytes;
-use h3::ext::Protocol;
+use futures_util::{SinkExt, StreamExt};
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
+
+use tokio_quiche::datagram_socket::DgramBuffer;
+use tokio_quiche::http3::driver::{
+    H3Event, IncomingH3Headers, InboundFrame, InboundFrameStream, OutboundFrame,
+    OutboundFrameSender, ServerH3Event,
+};
+use tokio_quiche::http3::settings::Http3Settings;
+use tokio_quiche::metrics::DefaultMetrics;
+use tokio_quiche::quiche::h3::{Header, NameValue};
+use tokio_quiche::settings::{CertificateKind, Hooks, QuicSettings, TlsCertificatePaths};
+use tokio_quiche::{listen, ConnectionParams, ServerH3Controller, ServerH3Driver};
 
 use crate::common::*;
+use crate::ip_server::{self, IpTunState};
 
 /// Server configuration parsed from CLI arguments.
 pub struct ServerConfig {
@@ -15,331 +31,289 @@ pub struct ServerConfig {
     pub cert: String,
     pub key: String,
     pub auth_token: Option<String>,
+    /// When set, enables CONNECT-IP with this IPv4 pool (CIDR).
+    pub ip_pool: Option<String>,
+    /// When set, enables CONNECT-IP with this IPv6 pool (CIDR).
+    pub ip6_pool: Option<String>,
+    /// MTU of the CONNECT-IP TUN device.
+    pub ip_mtu: u16,
+    /// Optional name for the CONNECT-IP TUN device.
+    pub ip_tun_name: Option<String>,
 }
 
-/// Run the MASQUE CONNECT-UDP proxy server.
+/// Transport tuning shared by all proxied protocols.
+pub(crate) fn server_quic_settings() -> QuicSettings {
+    let mut qs = QuicSettings::default();
+    qs.cc_algorithm = "bbr2".to_string();
+    qs.enable_dgram = true;
+    qs.dgram_recv_max_queue_len = 65_536;
+    qs.dgram_send_max_queue_len = 65_536;
+    qs.max_idle_timeout = Some(Duration::from_secs(30));
+    qs
+}
+
+/// Run the MASQUE proxy server.
 pub async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listen_addr: SocketAddr = config.listen.parse()?;
+    let socket = UdpSocket::bind(listen_addr).await?;
 
-    let certs = load_certs(&config.cert)?;
-    let key = load_key(&config.key)?;
+    let params = ConnectionParams::new_server(
+        server_quic_settings(),
+        TlsCertificatePaths {
+            cert: config.cert.as_str(),
+            private_key: config.key.as_str(),
+            kind: CertificateKind::X509,
+        },
+        Hooks::default(),
+    );
 
-    let mut server_crypto = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)?;
-    server_crypto.alpn_protocols = vec![b"h3".to_vec()];
-    server_crypto.max_early_data_size = u32::MAX;
-    server_crypto.send_half_rtt_data = true;
-
-    let mut transport = quinn::TransportConfig::default();
-    transport.initial_mtu(1350);
-    transport.datagram_receive_buffer_size(Some(8_000_000));
-    transport.datagram_send_buffer_size(8_000_000);
-    transport.max_idle_timeout(Some(
-        std::time::Duration::from_secs(30)
-            .try_into()
-            .map_err(|e| format!("{e}"))?,
-    ));
-    transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
-
-    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
-        quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)?,
-    ));
-    server_config.transport_config(Arc::new(transport));
-
-    let endpoint = quinn::Endpoint::server(server_config, listen_addr)?;
+    let mut listeners = listen([socket], params, DefaultMetrics)?;
     log::info!("[server] MASQUE server listening on {listen_addr}");
 
-    let auth_token = config.auth_token;
-    while let Some(incoming) = endpoint.accept().await {
-        let auth_token = auth_token.clone();
-        tokio::spawn(async move {
-            let conn = match incoming.accept() {
-                Ok(c) => match c.await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        log::error!("[server] Connection failed: {e}");
-                        return;
-                    }
-                },
-                Err(e) => {
-                    log::error!("[server] Accept error: {e}");
-                    return;
-                }
-            };
-            log::info!("[server] Connection from {}", conn.remote_address());
-            if let Err(e) = handle_connection(conn, auth_token).await {
-                log::error!("[server] Connection error: {e}");
+    // CONNECT-IP is opt-in: it needs a TUN device (root) and an address pool.
+    let ip_state = if config.ip_pool.is_some() || config.ip6_pool.is_some() {
+        Some(ip_server::init(&ip_server::IpConfig {
+            pool_v4: config.ip_pool.clone(),
+            pool_v6: config.ip6_pool.clone(),
+            mtu: config.ip_mtu,
+            tun_name: config.ip_tun_name.clone(),
+        })?)
+    } else {
+        None
+    };
+
+    let auth = Arc::new(config.auth_token.clone());
+    let accept = &mut listeners[0];
+    while let Some(conn) = accept.next().await {
+        let conn = match conn {
+            Ok(c) => c,
+            Err(e) => {
+                log::error!("[server] accept error: {e:?}");
+                continue;
             }
-            log::info!("[server] Connection closed");
+        };
+        log::info!("[server] new connection");
+
+        let (driver, controller) = ServerH3Driver::new(Http3Settings {
+            enable_extended_connect: true,
+            ..Default::default()
+        });
+        conn.start(driver);
+
+        let auth = auth.clone();
+        let ip_state = ip_state.clone();
+        tokio::spawn(async move {
+            handle_connection(controller, auth, ip_state).await;
+            log::info!("[server] connection closed");
         });
     }
 
     Ok(())
 }
 
-/// Per-session state: keeps the CONNECT-UDP stream alive and tracks the target socket.
-struct Session {
-    target: Arc<UdpSocket>,
-    /// Hold the CONNECT-UDP stream to prevent it from being dropped.
-    /// RFC 9298 §3.2: the session lifetime is tied to the stream — dropping
-    /// it sends FIN which terminates the session from the client's perspective.
-    _stream: h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
-    /// Abort handle for the spawned target reader task. UDP recv() never
-    /// returns on its own when the client goes away, so we must explicitly
-    /// abort the reader on session drop — otherwise the task keeps the
-    /// Arc<UdpSocket> alive and leaks an fd per stale session.
-    reader: tokio::task::AbortHandle,
-}
-
-impl Drop for Session {
-    fn drop(&mut self) {
-        self.reader.abort();
-    }
-}
-
 async fn handle_connection(
-    quinn_conn: quinn::Connection,
-    auth_token: Option<String>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Clone for datagram I/O — h3-quinn takes ownership of one clone for H3 stream processing
-    let dgram_conn = quinn_conn.clone();
+    mut controller: ServerH3Controller,
+    auth: Arc<Option<String>>,
+    ip_state: Option<Arc<IpTunState>>,
+) {
+    // NewFlow fires before Headers for a CONNECT request; stash flow halves by
+    // flow_id and pair them on Headers (flow_id == stream_id / 4).
+    let mut pending_flows: HashMap<u64, (OutboundFrameSender, InboundFrameStream)> = HashMap::new();
 
-    let h3_conn = h3_quinn::Connection::new(quinn_conn);
-    let mut h3 = {
-        let mut builder = h3::server::builder();
-        builder.enable_extended_connect(true);
-        builder.enable_datagram(true);
-        builder
-            .build::<h3_quinn::Connection, Bytes>(h3_conn)
-            .await?
-    };
-
-    let mut sessions: HashMap<u64, Session> = HashMap::new();
-    let (cleanup_tx, mut cleanup_rx) = mpsc::channel::<u64>(64);
-
-    loop {
-        tokio::select! {
-            // Accept new H3 requests (also drives the H3 connection)
-            result = h3.accept() => {
-                match result {
-                    Ok(Some(resolver)) => {
-                        match resolver.resolve_request().await {
-                            Ok((req, stream)) => {
-                                handle_request(
-                                    req, stream, &mut sessions, &auth_token,
-                                    &dgram_conn, &cleanup_tx,
-                                ).await;
-                            }
-                            Err(e) => log::error!("[server] Request resolve error: {e}"),
-                        }
-                    }
-                    Ok(None) => break,
-                    Err(e) => {
-                        log::error!("[server] H3 error: {e}");
-                        break;
-                    }
-                }
+    while let Some(ev) = controller.event_receiver_mut().recv().await {
+        match ev {
+            ServerH3Event::Core(H3Event::NewFlow {
+                flow_id,
+                send,
+                recv,
+            }) => {
+                pending_flows.insert(flow_id, (send, recv));
             }
-            // Client -> target: decode DATAGRAM and forward
-            result = dgram_conn.read_datagram() => {
-                let data = result?;
-                if let Some((stream_id, payload)) = decode_datagram(&data) {
-                    if let Some(session) = sessions.get(&stream_id) {
-                        let _ = session.target.try_send(payload);
-                    } else {
-                        log::trace!("[server] No session for stream_id={stream_id}");
-                    }
-                }
+            ServerH3Event::Headers {
+                incoming_headers, ..
+            } => {
+                handle_request(incoming_headers, &mut pending_flows, &auth, &ip_state).await;
             }
-            // Session cleanup: remove closed sessions
-            Some(stream_id) = cleanup_rx.recv() => {
-                if sessions.remove(&stream_id).is_some() {
-                    log::info!("[server] Session cleaned up: stream_id={stream_id}");
-                }
-            }
+            ServerH3Event::Core(H3Event::ConnectionShutdown(_))
+            | ServerH3Event::Core(H3Event::ConnectionError(_)) => break,
+            _ => {}
         }
     }
+}
 
-    let count = sessions.len();
-    if count > 0 {
-        log::info!("[server] Connection closing, dropping {count} remaining session(s)");
-    }
-
-    Ok(())
+/// Send a bare status response (no body, no FIN) on a request stream.
+async fn reply_status(send: &mut OutboundFrameSender, status: &[u8]) {
+    let _ = send
+        .send(OutboundFrame::Headers(
+            vec![Header::new(b":status", status)],
+            None,
+        ))
+        .await;
 }
 
 async fn handle_request(
-    req: http::Request<()>,
-    mut stream: h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
-    sessions: &mut HashMap<u64, Session>,
-    auth_token: &Option<String>,
-    dgram_conn: &quinn::Connection,
-    cleanup_tx: &mpsc::Sender<u64>,
+    headers: IncomingH3Headers,
+    pending_flows: &mut HashMap<u64, (OutboundFrameSender, InboundFrameStream)>,
+    auth: &Arc<Option<String>>,
+    ip_state: &Option<Arc<IpTunState>>,
 ) {
-    let protocol = req.extensions().get::<Protocol>();
-    let is_connect_udp = req.method() == http::Method::CONNECT
-        && protocol.map(|p| p.as_str()) == Some("connect-udp");
+    let IncomingH3Headers {
+        stream_id,
+        headers: hdrs,
+        mut send,
+        recv,
+        ..
+    } = headers;
 
-    if !is_connect_udp {
-        let resp = http::Response::builder().status(405).body(()).unwrap();
-        let _ = stream.send_response(resp).await;
-        return;
+    let (mut method, mut protocol, mut path, mut authz) = (None, None, None, None);
+    for h in &hdrs {
+        match h.name() {
+            b":method" => method = Some(h.value().to_vec()),
+            b":protocol" => protocol = Some(h.value().to_vec()),
+            b":path" => path = Some(h.value().to_vec()),
+            b"proxy-authorization" => authz = Some(h.value().to_vec()),
+            _ => {}
+        }
     }
 
-    // Auth check
-    if let Some(expected) = auth_token {
+    // Auth check.
+    if let Some(expected) = auth.as_ref() {
         let expected_header = format!("Bearer {expected}");
-        let auth_ok = req
-            .headers()
-            .get("proxy-authorization")
-            .and_then(|v| v.to_str().ok())
-            == Some(&expected_header);
-        if !auth_ok {
-            log::warn!("[server] Auth failed");
-            let resp = http::Response::builder().status(407).body(()).unwrap();
-            let _ = stream.send_response(resp).await;
+        if authz.as_deref() != Some(expected_header.as_bytes()) {
+            log::warn!("[server] auth failed");
+            reply_status(&mut send, b"407").await;
             return;
         }
     }
 
-    // Parse target from URI path
-    let path = req.uri().path();
-    let (host, port) = match parse_connect_udp_path(path) {
-        Some(v) => v,
-        None => {
-            log::info!("[server] Invalid path: {path}");
-            let resp = http::Response::builder().status(400).body(()).unwrap();
-            let _ = stream.send_response(resp).await;
-            return;
-        }
-    };
-
-    // Resolve and connect to target. IP literals (including percent-decoded
-    // IPv6) are used directly; only hostnames go through DNS resolution.
-    let target_addr = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        SocketAddr::new(ip, port)
-    } else {
-        match tokio::net::lookup_host(format!("{host}:{port}")).await {
-            Ok(mut addrs) => match addrs.next() {
-                Some(a) => a,
-                None => {
-                    let resp = http::Response::builder().status(502).body(()).unwrap();
-                    let _ = stream.send_response(resp).await;
-                    return;
-                }
-            },
-            Err(e) => {
-                log::error!("[server] DNS error for {host}:{port}: {e}");
-                let resp = http::Response::builder().status(502).body(()).unwrap();
-                let _ = stream.send_response(resp).await;
+    let is_connect = method.as_deref() == Some(b"CONNECT");
+    match protocol.as_deref() {
+        Some(b"connect-udp") if is_connect => {}
+        Some(b"connect-ip") if is_connect => {
+            let Some(ip_state) = ip_state else {
+                log::info!("[server] CONNECT-IP request but no --ip-pool configured");
+                reply_status(&mut send, b"501").await;
                 return;
-            }
+            };
+            let flow_id = stream_id / 4;
+            let Some((flow_send, flow_recv)) = pending_flows.remove(&flow_id) else {
+                log::warn!("[server] no datagram flow for CONNECT-IP stream_id={stream_id}");
+                return;
+            };
+            let path_str = path
+                .as_deref()
+                .and_then(|p| std::str::from_utf8(p).ok())
+                .unwrap_or("")
+                .to_string();
+            ip_server::handle_ip_request(
+                ip_state, stream_id, &path_str, send, recv, flow_send, flow_recv,
+            )
+            .await;
+            return;
         }
+        _ => {
+            reply_status(&mut send, b"405").await;
+            return;
+        }
+    }
+
+    // Parse target host/port from the path.
+    let target = path
+        .as_deref()
+        .and_then(|p| std::str::from_utf8(p).ok())
+        .and_then(parse_connect_udp_path);
+    let Some((host, port)) = target else {
+        log::info!("[server] invalid CONNECT-UDP path");
+        reply_status(&mut send, b"400").await;
+        return;
     };
 
-    let bind_addr = if target_addr.is_ipv4() {
-        "0.0.0.0:0"
-    } else {
-        "[::]:0"
-    };
-    let target = match UdpSocket::bind(bind_addr).await {
-        Ok(s) => s,
-        Err(e) => {
-            log::error!("[server] Cannot bind target socket: {e}");
-            let resp = http::Response::builder().status(502).body(()).unwrap();
-            let _ = stream.send_response(resp).await;
+    // Resolve and connect to the target.
+    let target_addr = match resolve_target(&host, port).await {
+        Some(a) => a,
+        None => {
+            reply_status(&mut send, b"502").await;
             return;
         }
     };
-    if let Err(e) = target.connect(target_addr).await {
-        log::error!("[server] Cannot connect to {target_addr}: {e}");
-        let resp = http::Response::builder().status(502).body(()).unwrap();
-        let _ = stream.send_response(resp).await;
+    let bind = if target_addr.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+    let udp = match UdpSocket::bind(bind).await {
+        Ok(u) => u,
+        Err(e) => {
+            log::error!("[server] cannot bind target socket: {e}");
+            reply_status(&mut send, b"502").await;
+            return;
+        }
+    };
+    if let Err(e) = udp.connect(target_addr).await {
+        log::error!("[server] cannot connect to {target_addr}: {e}");
+        reply_status(&mut send, b"502").await;
         return;
     }
 
-    // Send 200 OK with capsule-protocol header (RFC 9297 §3.4)
-    let resp = http::Response::builder()
-        .status(200)
-        .header("capsule-protocol", "?1")
-        .body(())
-        .unwrap();
-    if let Err(e) = stream.send_response(resp).await {
-        log::error!("[server] Failed to send 200: {e}");
+    let flow_id = stream_id / 4;
+    let Some((flow_send, flow_recv)) = pending_flows.remove(&flow_id) else {
+        log::warn!("[server] no datagram flow for stream_id={stream_id}");
         return;
-    }
+    };
 
-    // Use the raw QUIC stream ID for session tracking, because DATAGRAMs
-    // carry Quarter Stream ID = quic_stream_id / 4, and decode_datagram
-    // reconstructs the full QUIC stream ID via qsid * 4.
-    // stream.send_id().index() returns quic_stream_id >> 2 which is NOT the
-    // same as the raw QUIC stream ID (it's off by a factor of 4).
-    let h3_index = stream.send_id().index();
-    let quic_stream_id = h3_index * 4; // Reconstruct raw QUIC stream ID
-    let target = Arc::new(target);
+    reply_status(&mut send, b"200").await;
+    log::info!("[server] CONNECT-UDP established: stream_id={stream_id} target={target_addr}");
 
-    log::info!(
-        "[server] CONNECT-UDP established: h3_index={h3_index} quic_stream_id={quic_stream_id} target={target_addr}"
-    );
+    tokio::spawn(bridge_target(
+        flow_id,
+        flow_send,
+        flow_recv,
+        Arc::new(udp),
+        send,
+    ));
+}
 
-    // Spawn target reader — encodes and sends DATAGRAMs directly on the QUIC
-    // connection, bypassing any per-connection channel. quinn::Connection is
-    // cheaply cloneable and send_datagram is internally synchronized, so each
-    // session's reader writes out concurrently. On send failure (connection
-    // closed) or recv error, the task exits and signals cleanup. The task is
-    // also force-aborted via Session::drop when the session is removed.
-    let conn_for_reader = dgram_conn.clone();
-    let cleanup = cleanup_tx.clone();
-    let reader_target = target.clone();
-    let handle = tokio::spawn(async move {
-        let mut buf = [0u8; 2048];
-        loop {
-            match reader_target.recv(&mut buf).await {
-                Ok(len) => {
-                    let dgram = encode_datagram(quic_stream_id, &buf[..len]);
-                    match conn_for_reader.send_datagram(dgram) {
-                        Ok(()) => {}
-                        Err(quinn::SendDatagramError::TooLarge) => {
-                            log::trace!("[server] drop oversized datagram for stream_id={quic_stream_id}: {len} bytes");
-                        }
-                        Err(_) => break,
-                    }
-                }
-                Err(e) => {
-                    log::warn!("[server] Target recv error for stream_id={quic_stream_id}: {e}");
-                    break;
-                }
+/// Bridge a connected target UDP socket to the tunnel's datagram flow.
+async fn bridge_target(
+    flow_id: u64,
+    mut flow_send: OutboundFrameSender,
+    mut flow_recv: InboundFrameStream,
+    udp: Arc<UdpSocket>,
+    _stream_keepalive: OutboundFrameSender,
+) {
+    // tunnel -> target
+    let udp_tx = udp.clone();
+    let t1 = tokio::spawn(async move {
+        while let Some(frame) = flow_recv.recv().await {
+            let InboundFrame::Datagram(buf) = frame else {
+                continue;
+            };
+            if let Some((0, payload)) = decode_context_payload(buf.as_slice()) {
+                let _ = udp_tx.send(payload).await;
             }
         }
-        let _ = cleanup.send(quic_stream_id).await;
     });
 
-    // Store the session — importantly, this moves `stream` into the Session struct
-    // so it stays alive for the duration of the CONNECT-UDP session.
-    sessions.insert(
-        quic_stream_id,
-        Session {
-            target,
-            _stream: stream,
-            reader: handle.abort_handle(),
-        },
-    );
+    // target -> tunnel
+    let t2 = tokio::spawn(async move {
+        let mut buf = vec![0u8; 65535];
+        while let Ok(n) = udp.recv(&mut buf).await {
+            let body = encode_context_payload(0, &buf[..n]);
+            if flow_send
+                .send(OutboundFrame::Datagram(DgramBuffer::from_slice(&body), flow_id))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    let _ = tokio::join!(t1, t2);
 }
 
-fn load_certs(
-    path: &str,
-) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, Box<dyn std::error::Error + Send + Sync>>
-{
-    let file = std::fs::File::open(path)?;
-    let mut reader = std::io::BufReader::new(file);
-    Ok(rustls_pemfile::certs(&mut reader).collect::<Result<Vec<_>, _>>()?)
-}
-
-fn load_key(
-    path: &str,
-) -> Result<rustls::pki_types::PrivateKeyDer<'static>, Box<dyn std::error::Error + Send + Sync>> {
-    let file = std::fs::File::open(path)?;
-    let mut reader = std::io::BufReader::new(file);
-    rustls_pemfile::private_key(&mut reader)?.ok_or_else(|| "no private key found in PEM file".into())
+async fn resolve_target(host: &str, port: u16) -> Option<SocketAddr> {
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return Some(SocketAddr::new(ip, port));
+    }
+    tokio::net::lookup_host(format!("{host}:{port}"))
+        .await
+        .ok()?
+        .next()
 }

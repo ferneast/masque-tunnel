@@ -2,7 +2,7 @@
 name = "masque-tunnel"
 version = "0.9.8"
 edition = "2021"
-description = "MASQUE CONNECT-UDP tunnel (RFC 9298)"
+description = "MASQUE tunnel: CONNECT-UDP (RFC 9298) and CONNECT-IP (RFC 9484)"
 
 [lib]
 name = "masque_tunnel"
@@ -13,19 +13,25 @@ name = "masque-tunnel"
 path = "src/main.rs"
 
 [dependencies]
-quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs", "log", "platform-verifier", "bloom"] }
-h3 = "0.0.8"
-h3-quinn = "0.0.10"
-http = "1"
-rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
-rustls-pemfile = "2"
+# QUIC + HTTP/3 via Cloudflare quiche and its async wrapper. tokio-quiche
+# re-exports `quiche` (and `quiche::h3`), so headers are raw name/value pairs
+# and `:protocol` accepts any token (no closed enum). BoringSSL is built by
+# boring-sys (needs cmake + a C/C++ toolchain).
+tokio-quiche = "0.19"
 tokio = { version = "1", features = ["net", "sync", "time", "rt-multi-thread", "macros"] }
+futures-util = "0.3"
 clap = { version = "4", features = ["derive"] }
 bytes = "1"
 url = "2"
 log = "0.4"
+tun-rs = { version = "2.8.7", features = ["async_tokio"] }
+# For --ca: load a custom CA into a BoringSSL context via tokio-quiche's
+# ConnectionHook. Pinned to the same boring the quiche stack links.
+boring = "4.22"
 
 [profile.release]
+# BoringSSL C objects don't participate in Rust LTO, but the Rust side still
+# benefits. panic=abort is fine — quiche does not rely on unwinding.
 lto = "fat"
 panic = "abort"
 codegen-units = 1
