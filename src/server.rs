@@ -141,13 +141,19 @@ async fn handle_connection(
     }
 }
 
-/// Send a bare status response (no body, no FIN) on a request stream.
+/// Send an error status response and close the stream cleanly with an empty
+/// FIN body, so non-CONNECT clients (and HTTP/3 checkers) see a proper
+/// response instead of a stream reset. Do NOT use for a CONNECT 200 — that
+/// stream must stay open for datagram forwarding.
 async fn reply_status(send: &mut OutboundFrameSender, status: &[u8]) {
     let _ = send
         .send(OutboundFrame::Headers(
             vec![Header::new(b":status", status)],
             None,
         ))
+        .await;
+    let _ = send
+        .send(OutboundFrame::Body(bytes::Bytes::new(), true))
         .await;
 }
 
@@ -257,7 +263,13 @@ async fn handle_request(
         return;
     };
 
-    reply_status(&mut send, b"200").await;
+    // 200 for CONNECT-UDP: no FIN — the stream stays open for datagrams.
+    let _ = send
+        .send(OutboundFrame::Headers(
+            vec![Header::new(b":status", b"200")],
+            None,
+        ))
+        .await;
     log::info!("[server] CONNECT-UDP established: stream_id={stream_id} target={target_addr}");
 
     tokio::spawn(bridge_target(

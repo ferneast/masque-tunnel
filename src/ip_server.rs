@@ -346,13 +346,18 @@ impl Drop for IpSessionGuard {
     }
 }
 
-/// Send a bare status response (no body, no FIN) on the request stream.
+/// Send an error status response and close the stream cleanly with an empty
+/// FIN body (so clients see a response, not a stream reset). Only used for
+/// CONNECT-IP errors — the success path keeps the stream open for capsules.
 async fn reply_status(send: &mut OutboundFrameSender, status: &[u8]) {
     let _ = send
         .send(OutboundFrame::Headers(
             vec![tokio_quiche::quiche::h3::Header::new(b":status", status)],
             None,
         ))
+        .await;
+    let _ = send
+        .send(OutboundFrame::Body(bytes::Bytes::new(), true))
         .await;
 }
 
