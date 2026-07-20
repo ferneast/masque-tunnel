@@ -1,6 +1,6 @@
 [package]
 name = "masque-tunnel"
-version = "0.11.1"
+version = "0.11.2"
 edition = "2021"
 description = "MASQUE tunnel: CONNECT-UDP (RFC 9298) and CONNECT-IP (RFC 9484)"
 

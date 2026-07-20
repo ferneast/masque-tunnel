@@ -7,11 +7,13 @@
 //! the operator added on top of it. Capsules arrive on the response stream
 //! body; IP packets travel on the datagram flow with a context ID of 0.
 
-use std::net::IpAddr;
+use std::collections::VecDeque;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures_util::SinkExt;
+use futures_util::stream::FuturesUnordered;
+use futures_util::{SinkExt, StreamExt};
 use tokio::sync::oneshot;
 use tun_rs::AsyncDevice;
 
@@ -22,7 +24,7 @@ use tokio_quiche::http3::driver::{
 };
 use tokio_quiche::http3::settings::Http3Settings;
 use tokio_quiche::quiche::h3::{Header, NameValue};
-use tokio_quiche::ClientH3Driver;
+use tokio_quiche::{ClientH3Controller, ClientH3Driver, QuicConnection};
 
 use crate::capsule::*;
 use crate::client::build_client_params;
@@ -60,11 +62,6 @@ pub async fn run(config: IpClientConfig) -> Result<(), Box<dyn std::error::Error
     let proxy_port = url.port().unwrap_or(443);
     let sni = config.sni.clone().unwrap_or_else(|| proxy_host.clone());
 
-    let proxy_addr = tokio::net::lookup_host(format!("{proxy_host}:{proxy_port}"))
-        .await?
-        .next()
-        .ok_or_else(|| format!("DNS resolution failed for {proxy_host}:{proxy_port}"))?;
-
     log::info!(
         "[client] CONNECT-IP mode, proxy={proxy_host}:{proxy_port} mtu={}",
         config.mtu
@@ -76,13 +73,12 @@ pub async fn run(config: IpClientConfig) -> Result<(), Box<dyn std::error::Error
     // reverted when this set drops — on shutdown signal below or process exit.
     let mut routes = crate::route::RouteSet::new();
     let mut dns = crate::dns::DnsGuard::new(config.dns.clone());
-    let proxy_ip = proxy_addr.ip();
 
     let reconnect = async {
         let mut backoff_ms = 500u64;
         loop {
             match run_tunnel(
-                &config, &proxy_host, &sni, proxy_addr, proxy_ip, &mut tun, &mut routes, &mut dns,
+                &config, &proxy_host, proxy_port, &sni, &mut tun, &mut routes, &mut dns,
             )
             .await
             {
@@ -128,6 +124,87 @@ async fn shutdown_signal() {
     }
 }
 
+/// Happy Eyeballs (RFC 8305): interleave address families, start a handshake
+/// every 250ms without waiting for the previous to fail, and return the first
+/// connection that completes — with its H3 controller and the winning address.
+async fn establish_connection(
+    addrs: Vec<SocketAddr>,
+    sni: &str,
+    config: &IpClientConfig,
+) -> Result<
+    (QuicConnection, ClientH3Controller, SocketAddr),
+    Box<dyn std::error::Error + Send + Sync>,
+> {
+    const ATTEMPT_DELAY: Duration = Duration::from_millis(250);
+    let mut pending = interleave_families(addrs).into_iter();
+    let mut running = FuturesUnordered::new();
+    let mut pending_done = false;
+    let mut last_err: Option<Box<dyn std::error::Error + Send + Sync>> = None;
+    let mut next_at = tokio::time::Instant::now();
+
+    loop {
+        tokio::select! {
+            biased;
+            Some(res) = running.next() => match res {
+                Ok(win) => return Ok(win),
+                Err(e) => last_err = Some(e),
+            },
+            _ = tokio::time::sleep_until(next_at), if !pending_done => match pending.next() {
+                Some(addr) => {
+                    let sni = sni.to_string();
+                    let insecure = config.insecure;
+                    let ca = config.ca.clone();
+                    running.push(async move {
+                        dial(addr, &sni, insecure, &ca)
+                            .await
+                            .map(|(conn, ctrl)| (conn, ctrl, addr))
+                    });
+                    next_at = tokio::time::Instant::now() + ATTEMPT_DELAY;
+                }
+                None => pending_done = true,
+            },
+        }
+        if pending_done && running.is_empty() {
+            return Err(last_err.unwrap_or_else(|| "no proxy addresses to connect to".into()));
+        }
+    }
+}
+
+/// One QUIC handshake attempt against a single address. Returns once the
+/// handshake completes (`connect_with_config` awaits establishment) or errors.
+async fn dial(
+    addr: SocketAddr,
+    sni: &str,
+    insecure: bool,
+    ca: &Option<String>,
+) -> Result<(QuicConnection, ClientH3Controller), Box<dyn std::error::Error + Send + Sync>> {
+    let bind = if addr.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+    let qsock = tokio::net::UdpSocket::bind(bind).await?;
+    qsock.connect(addr).await?;
+    let params = build_client_params(insecure, ca);
+    let (driver, controller) = ClientH3Driver::new(Http3Settings::default());
+    let socket: tokio_quiche::socket::Socket<_, _> = qsock.try_into()?;
+    let conn = tokio_quiche::quic::connect_with_config(socket, Some(sni), &params, driver).await?;
+    Ok((conn, controller))
+}
+
+/// Order addresses for Happy Eyeballs: keep each family's system (RFC 6724)
+/// order, but alternate families starting with whichever the system preferred.
+fn interleave_families(addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    let v6_first = addrs.first().map(|a| a.is_ipv6()).unwrap_or(false);
+    let v6: VecDeque<SocketAddr> = addrs.iter().copied().filter(|a| a.is_ipv6()).collect();
+    let v4: VecDeque<SocketAddr> = addrs.iter().copied().filter(|a| a.is_ipv4()).collect();
+    let mut out = Vec::with_capacity(addrs.len());
+    let (mut first, mut second) = if v6_first { (v6, v4) } else { (v4, v6) };
+    while !first.is_empty() || !second.is_empty() {
+        if let Some(a) = first.pop_front() {
+            out.push(a);
+        }
+        std::mem::swap(&mut first, &mut second);
+    }
+    out
+}
+
 /// One event handled by the forwarding loop, collected as an owned value so
 /// the borrows taken inside `select!` end before we touch `tun`.
 enum Event {
@@ -141,22 +218,21 @@ enum Event {
 async fn run_tunnel(
     config: &IpClientConfig,
     proxy_host: &str,
+    proxy_port: u16,
     sni: &str,
-    proxy_addr: std::net::SocketAddr,
-    proxy_ip: IpAddr,
     tun: &mut Option<TunBinding>,
     routes: &mut crate::route::RouteSet,
     dns: &mut crate::dns::DnsGuard,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let bind = if proxy_addr.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
-    let qsock = tokio::net::UdpSocket::bind(bind).await?;
-    qsock.connect(proxy_addr).await?;
-
-    let params = build_client_params(config.insecure, &config.ca);
-    let (driver, mut controller) = ClientH3Driver::new(Http3Settings::default());
-    let socket: tokio_quiche::socket::Socket<_, _> = qsock.try_into()?;
-    let _conn = tokio_quiche::quic::connect_with_config(socket, Some(sni), &params, driver).await?;
-    log::info!("[client] QUIC connected to {proxy_addr}");
+    // Resolve every address and race QUIC handshakes across them (Happy
+    // Eyeballs, RFC 8305), so a dead address family (e.g. IPv6 with blocked
+    // UDP) doesn't wedge the client: the first family to connect wins.
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((proxy_host, proxy_port))
+        .await?
+        .collect();
+    let (_conn, mut controller, winning) = establish_connection(addrs, sni, config).await?;
+    let proxy_ip = winning.ip();
+    log::info!("[client] QUIC connected to {winning}");
 
     // Full-tunnel CONNECT-IP request: target and ipproto are both `*`.
     let path = format!("{CONNECT_IP_PATH}/*/*/");
@@ -507,4 +583,46 @@ fn fmt_addrs(addrs: &[(IpAddr, u8)]) -> String {
         .map(|(a, p)| format!("{a}/{p}"))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sa(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn interleave_alternates_starting_with_system_preference() {
+        // System put IPv6 first → v6, v4, v6, ... (each family keeps its order).
+        let addrs = vec![
+            sa("[2001:db8::1]:443"),
+            sa("[2001:db8::2]:443"),
+            sa("10.0.0.1:443"),
+        ];
+        assert_eq!(
+            interleave_families(addrs),
+            vec![
+                sa("[2001:db8::1]:443"),
+                sa("10.0.0.1:443"),
+                sa("[2001:db8::2]:443"),
+            ]
+        );
+    }
+
+    #[test]
+    fn interleave_v4_first_when_system_prefers_v4() {
+        let addrs = vec![sa("10.0.0.1:443"), sa("[2001:db8::1]:443")];
+        assert_eq!(
+            interleave_families(addrs),
+            vec![sa("10.0.0.1:443"), sa("[2001:db8::1]:443")]
+        );
+    }
+
+    #[test]
+    fn interleave_single_family_is_unchanged() {
+        let addrs = vec![sa("10.0.0.1:443"), sa("10.0.0.2:443")];
+        assert_eq!(interleave_families(addrs.clone()), addrs);
+    }
 }
