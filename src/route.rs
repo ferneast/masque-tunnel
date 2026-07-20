@@ -62,6 +62,14 @@ impl RouteSet {
         self.direct.is_empty() && self.pin.is_none()
     }
 
+    /// True if `ip` falls within any installed direct route (i.e. it would be
+    /// routed into the tunnel). Used to check whether DNS servers are tunneled.
+    pub fn covers(&self, ip: IpAddr) -> bool {
+        self.direct
+            .iter()
+            .any(|(dst, prefix)| cidr_contains(*dst, *prefix, ip))
+    }
+
     /// Reconcile installed routes with `ranges` (the complete advertised set).
     /// Newly advertised ranges are installed; ranges no longer present are
     /// withdrawn (declarative supersede). A default range is taken over only
@@ -185,6 +193,27 @@ pub fn is_default_range(start: IpAddr, end: IpAddr) -> bool {
         }
         (IpAddr::V6(s), IpAddr::V6(e)) => {
             s == Ipv6Addr::UNSPECIFIED && e == Ipv6Addr::from(u128::MAX)
+        }
+        _ => false,
+    }
+}
+
+/// True if `ip` is inside the CIDR block `net/prefix` (same family).
+fn cidr_contains(net: IpAddr, prefix: u8, ip: IpAddr) -> bool {
+    match (net, ip) {
+        (IpAddr::V4(n), IpAddr::V4(i)) => {
+            if prefix == 0 {
+                return true;
+            }
+            let mask = u32::MAX << (32 - prefix);
+            (u32::from(n) & mask) == (u32::from(i) & mask)
+        }
+        (IpAddr::V6(n), IpAddr::V6(i)) => {
+            if prefix == 0 {
+                return true;
+            }
+            let mask = u128::MAX << (128 - prefix);
+            (u128::from(n) & mask) == (u128::from(i) & mask)
         }
         _ => false,
     }
@@ -585,5 +614,19 @@ mod tests {
         let (d, redirect) = desired_routes(&[], true);
         assert!(d.is_empty());
         assert!(!redirect);
+    }
+
+    #[test]
+    fn cidr_contains_matches() {
+        // Split-default halves partition the v4 space.
+        assert!(cidr_contains(v4("0.0.0.0"), 1, v4("1.1.1.1")));
+        assert!(cidr_contains(v4("128.0.0.0"), 1, v4("202.96.134.133")));
+        assert!(!cidr_contains(v4("128.0.0.0"), 1, v4("1.1.1.1")));
+        // Specific prefix.
+        assert!(cidr_contains(v4("10.0.0.0"), 8, v4("10.5.5.5")));
+        assert!(!cidr_contains(v4("10.0.0.0"), 8, v4("11.0.0.1")));
+        // /0 covers everything; mixed family never matches.
+        assert!(cidr_contains(v4("0.0.0.0"), 0, v4("8.8.8.8")));
+        assert!(!cidr_contains(v4("0.0.0.0"), 0, v6("2001:db8::1")));
     }
 }

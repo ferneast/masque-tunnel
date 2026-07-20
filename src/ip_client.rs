@@ -41,6 +41,8 @@ pub struct IpClientConfig {
     pub tun_name: Option<String>,
     /// Take over the host default route when the proxy advertises a full tunnel.
     pub redirect_gateway: bool,
+    /// System DNS resolver(s) to install while the tunnel is up (empty = off).
+    pub dns: Vec<std::net::IpAddr>,
 }
 
 /// The active TUN device plus the assignment it was configured with.
@@ -73,13 +75,14 @@ pub async fn run(config: IpClientConfig) -> Result<(), Box<dyn std::error::Error
     // Host routes we install (full-tunnel redirect and/or specific routes),
     // reverted when this set drops — on shutdown signal below or process exit.
     let mut routes = crate::route::RouteSet::new();
+    let mut dns = crate::dns::DnsGuard::new(config.dns.clone());
     let proxy_ip = proxy_addr.ip();
 
     let reconnect = async {
         let mut backoff_ms = 500u64;
         loop {
             match run_tunnel(
-                &config, &proxy_host, &sni, proxy_addr, proxy_ip, &mut tun, &mut routes,
+                &config, &proxy_host, &sni, proxy_addr, proxy_ip, &mut tun, &mut routes, &mut dns,
             )
             .await
             {
@@ -143,6 +146,7 @@ async fn run_tunnel(
     proxy_ip: IpAddr,
     tun: &mut Option<TunBinding>,
     routes: &mut crate::route::RouteSet,
+    dns: &mut crate::dns::DnsGuard,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let bind = if proxy_addr.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
     let qsock = tokio::net::UdpSocket::bind(bind).await?;
@@ -262,7 +266,7 @@ async fn run_tunnel(
                 loop {
                     match parser.next_capsule() {
                         Ok(Some(capsule)) => {
-                            handle_capsule(capsule, tun, config, routes, proxy_ip)?
+                            handle_capsule(capsule, tun, config, routes, proxy_ip, dns)?
                         }
                         Ok(None) => break,
                         Err(e) => return Err(format!("malformed capsule: {e}").into()),
@@ -324,12 +328,14 @@ async fn run_tunnel(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_capsule(
     capsule: Capsule,
     tun: &mut Option<TunBinding>,
     config: &IpClientConfig,
     routes: &mut crate::route::RouteSet,
     proxy_ip: IpAddr,
+    dns: &mut crate::dns::DnsGuard,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match capsule.capsule_type {
         CAPSULE_ADDRESS_ASSIGN => {
@@ -383,6 +389,13 @@ fn handle_capsule(
             // withdraw any that this advertisement no longer contains.
             if let Err(e) = routes.reconcile(&ranges, config.redirect_gateway, proxy_ip, &tun_name) {
                 log::error!("[client] failed to apply advertised routes: {e}");
+            }
+            // Routes are now current; take over DNS if requested (idempotent,
+            // so this only acts on the first advertisement).
+            if dns.is_enabled() {
+                if let Err(e) = dns.ensure_applied(routes) {
+                    log::error!("[client] failed to set DNS: {e}");
+                }
             }
         }
         CAPSULE_ADDRESS_REQUEST => {

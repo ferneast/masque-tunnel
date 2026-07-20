@@ -102,6 +102,12 @@ enum Commands {
         /// gateway and installs a split default. Reverted on exit (Ctrl-C).
         #[arg(long)]
         redirect_gateway: bool,
+
+        /// Set the system DNS resolver(s) while the tunnel is up (repeatable),
+        /// restored on exit. Independent of --redirect-gateway; logs a leak
+        /// warning if the resolver is not routed through the tunnel.
+        #[arg(long)]
+        dns: Vec<std::net::IpAddr>,
     },
 
     /// Run as MASQUE proxy server (CONNECT-UDP always; CONNECT-IP with --ip-pool)
@@ -180,6 +186,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             mtu,
             tun_name,
             redirect_gateway,
+            dns,
         } => {
             ip_client::run(ip_client::IpClientConfig {
                 proxy_url,
@@ -190,6 +197,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 mtu,
                 tun_name,
                 redirect_gateway,
+                dns,
             })
             .await
         }
