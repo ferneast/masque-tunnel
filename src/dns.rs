@@ -18,7 +18,8 @@
 
 use std::io;
 use std::net::IpAddr;
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+// Only macOS uses Command (networksetup); Linux rewrites /etc/resolv.conf.
+#[cfg(target_os = "macos")]
 use std::process::Command;
 
 /// RAII system-DNS override. Applying is idempotent; the original configuration
