@@ -13,7 +13,7 @@ use tokio::net::UdpSocket;
 
 use tokio_quiche::datagram_socket::DgramBuffer;
 use tokio_quiche::http3::driver::{
-    H3Event, IncomingH3Headers, InboundFrame, InboundFrameStream, OutboundFrame,
+    H3Event, InboundFrame, InboundFrameStream, IncomingH3Headers, OutboundFrame,
     OutboundFrameSender, ServerH3Event,
 };
 use tokio_quiche::http3::settings::Http3Settings;
@@ -48,6 +48,12 @@ pub(crate) fn server_quic_settings() -> QuicSettings {
     qs.enable_dgram = true;
     qs.dgram_recv_max_queue_len = 65_536;
     qs.dgram_send_max_queue_len = 65_536;
+    // quiche defaults max_send_udp_payload_size to 1200, leaving only ~1157
+    // bytes of writable DATAGRAM — smaller than a WireGuard data packet, which
+    // then gets silently dropped (the handshake fits, bulk data does not).
+    // Raise it to fill a 1500-MTU path (1452 + 28 IP/UDP = 1480, under PPPoE's
+    // 1492) so a full-size WG packet fits in one DATAGRAM.
+    qs.max_send_udp_payload_size = 1452;
     qs.max_idle_timeout = Some(Duration::from_secs(30));
     qs
 }
@@ -242,7 +248,11 @@ async fn handle_request(
             return;
         }
     };
-    let bind = if target_addr.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+    let bind = if target_addr.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
     let udp = match UdpSocket::bind(bind).await {
         Ok(u) => u,
         Err(e) => {
@@ -308,7 +318,10 @@ async fn bridge_target(
         while let Ok(n) = udp.recv(&mut buf).await {
             let body = encode_context_payload(0, &buf[..n]);
             if flow_send
-                .send(OutboundFrame::Datagram(DgramBuffer::from_slice(&body), flow_id))
+                .send(OutboundFrame::Datagram(
+                    DgramBuffer::from_slice(&body),
+                    flow_id,
+                ))
                 .await
                 .is_err()
             {

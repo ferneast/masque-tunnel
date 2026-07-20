@@ -47,6 +47,9 @@ pub(crate) fn client_quic_settings(insecure: bool) -> QuicSettings {
     qs.enable_dgram = true;
     qs.dgram_recv_max_queue_len = 65_536;
     qs.dgram_send_max_queue_len = 65_536;
+    // See server.rs: raise from quiche's 1200 default so a full-size WireGuard
+    // packet fits in one QUIC DATAGRAM instead of being silently dropped.
+    qs.max_send_udp_payload_size = 1452;
     qs.max_idle_timeout = Some(Duration::from_secs(30));
     // verify_peer defaults to false in tokio-quiche; only enable it when the
     // caller did not ask for --insecure. Custom-CA (--ca) support still needs
