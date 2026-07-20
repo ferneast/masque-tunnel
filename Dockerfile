@@ -11,7 +11,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
 
 # --locked: build exactly the committed Cargo.lock for reproducibility.
-RUN cargo build --release --locked && cp target/release/masque-tunnel /masque-tunnel
+RUN cargo build --release --locked --bin masque-tunnel && cp target/release/masque-tunnel /masque-tunnel
 
 # Stage 2: minimal glibc runtime. BoringSSL is statically linked into the
 # binary, so only glibc + libgcc are needed at runtime — not a static binary,

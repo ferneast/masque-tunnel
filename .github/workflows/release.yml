@@ -37,7 +37,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake clang
 
       - name: Build release binary
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: cargo build --release --locked --bin masque-tunnel --target ${{ matrix.target }}
 
       - name: Package binary
         run: |
