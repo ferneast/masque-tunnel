@@ -61,25 +61,24 @@ impl DnsGuard {
                 self.servers
             );
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
-            self.saved = apply_macos(&self.servers)?;
+            #[cfg(target_os = "macos")]
+            {
+                self.saved = apply_macos(&self.servers)?;
+            }
+            #[cfg(target_os = "linux")]
+            {
+                self.saved = apply_linux(&self.servers)?;
+            }
+            self.applied = true;
+            log::info!(
+                "[client] system DNS set to {:?} (restored on exit)",
+                self.servers
+            );
         }
-        #[cfg(target_os = "linux")]
-        {
-            self.saved = apply_linux(&self.servers)?;
-        }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        {
-            return Err(io::Error::other(
-                "--dns is not supported on this platform",
-            ));
-        }
-        self.applied = true;
-        log::info!(
-            "[client] system DNS set to {:?} (restored on exit)",
-            self.servers
-        );
+        // Other platforms (iOS/tvOS): the host's NetworkExtension configures the
+        // resolver (`NEDNSSettings`), so there is nothing to apply here.
         Ok(())
     }
 

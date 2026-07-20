@@ -1,12 +1,14 @@
 [package]
 name = "masque-tunnel"
-version = "0.11.2"
+version = "0.12.0"
 edition = "2021"
 description = "MASQUE tunnel: CONNECT-UDP (RFC 9298) and CONNECT-IP (RFC 9484)"
 
 [lib]
 name = "masque_tunnel"
 path = "src/lib.rs"
+# `lib` (rlib) for the bin + tests; `staticlib` for the iOS/tvOS xcframework.
+crate-type = ["lib", "staticlib"]
 
 [[bin]]
 name = "masque-tunnel"

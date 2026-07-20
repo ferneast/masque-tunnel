@@ -28,6 +28,7 @@
 use std::collections::HashSet;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::process::Command;
 
 /// The host's current default gateway for one address family.
@@ -366,6 +367,7 @@ pub fn default_gateway(_v6: bool) -> Option<Gateway> {
 
 /// Run a route command, mapping "file exists"/"already in table" to success so
 /// re-adding an existing route is not fatal.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn run_route(cmd: &mut Command, action: &str) -> io::Result<()> {
     let out = cmd.output()?;
     if out.status.success() {

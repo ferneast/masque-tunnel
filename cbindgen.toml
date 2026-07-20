@@ -1,0 +1,15 @@
+language = "C"
+include_guard = "MASQUE_TUNNEL_H"
+tab_width = 4
+style = "type"
+documentation = true
+documentation_style = "c"
+
+[export]
+include = ["MasqueCallbacks", "MasqueHandle"]
+
+[parse]
+parse_deps = false
+
+[fn]
+sort_by = "None"

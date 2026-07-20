@@ -45,6 +45,23 @@ pub struct IpClientConfig {
     pub redirect_gateway: bool,
     /// System DNS resolver(s) to install while the tunnel is up (empty = off).
     pub dns: Vec<std::net::IpAddr>,
+    /// iOS/tvOS: adopt this TUN fd (from `NEPacketTunnelProvider`) instead of
+    /// creating a device with tun-rs. Ignored on desktop.
+    pub tun_fd: Option<std::os::fd::RawFd>,
+    /// Host callbacks that program the platform config the Rust core does not
+    /// do itself (iOS/tvOS: `NEIPv4Settings` / routes / DNS). `None` on desktop,
+    /// where the client configures the TUN, routes, and DNS directly.
+    pub events: Option<std::sync::Arc<dyn ClientEvents>>,
+}
+
+/// Host-side configuration callbacks. On iOS/tvOS the `NEPacketTunnelProvider`
+/// uses these to program addresses and routes/DNS from the proxy's capsules; on
+/// desktop they are unset and the client programs everything itself.
+pub trait ClientEvents: Send + Sync {
+    /// The complete assigned address set (RFC 9484 ADDRESS_ASSIGN).
+    fn addresses_assigned(&self, addrs: &[(IpAddr, u8)]);
+    /// The advertised route set (RFC 9484 ROUTE_ADVERTISEMENT).
+    fn routes_advertised(&self, ranges: &[crate::capsule::IpAddressRange]);
 }
 
 /// The active TUN device plus the assignment it was configured with.
@@ -429,6 +446,11 @@ fn handle_capsule(
             new_addrs.sort();
             new_addrs.dedup();
             apply_address_assign(tun, routes, &new_addrs, config)?;
+            // iOS/tvOS: the host programs NEIPv4/6Settings from the assigned
+            // set. On desktop `events` is None and the TUN already carries them.
+            if let Some(events) = &config.events {
+                events.addresses_assigned(&new_addrs);
+            }
         }
         CAPSULE_ROUTE_ADVERTISEMENT => {
             let Some(ranges) = parse_route_advertisement(&capsule.payload) else {
@@ -440,7 +462,6 @@ fn handle_capsule(
                 log::warn!("[client] ROUTE_ADVERTISEMENT before an address was assigned; ignoring");
                 return Ok(());
             };
-            let tun_name = binding.dev.name().unwrap_or_default();
             for r in &ranges {
                 let proto = if r.ip_proto == 0 {
                     "any".to_string()
@@ -452,6 +473,15 @@ fn handle_capsule(
                     r.start,
                     r.end
                 );
+            }
+            // iOS/tvOS: the host programs routes + DNS (NEIPv4Route /
+            // NEDNSSettings) from the advertisement; desktop installs them here.
+            if let Some(events) = &config.events {
+                events.routes_advertised(&ranges);
+                return Ok(());
+            }
+            let tun_name = crate::tun_platform::device_name(&binding.dev);
+            for r in &ranges {
                 // Full tunnel is only taken over on opt-in (RFC 9484 §4.7.3
                 // leaves this to local policy); hint if the operator hasn't.
                 if crate::route::is_default_range(r.start, r.end) && !config.redirect_gateway {
@@ -498,8 +528,13 @@ fn apply_address_assign(
             if new_addrs.is_empty() {
                 return Ok(()); // no device and no addresses — nothing to do
             }
-            let dev = create_tun(new_addrs, config)?;
-            let name = dev.name().unwrap_or_else(|_| "?".into());
+            let dev = crate::tun_platform::create_device(
+                new_addrs,
+                config.mtu,
+                config.tun_name.as_deref(),
+                config.tun_fd,
+            )?;
+            let name = crate::tun_platform::device_name(&dev);
             log::info!(
                 "[client] TUN {name} up: {} mtu={}",
                 fmt_addrs(new_addrs),
@@ -529,51 +564,16 @@ fn apply_address_assign(
             let want: std::collections::HashSet<(IpAddr, u8)> =
                 new_addrs.iter().copied().collect();
             for (addr, prefix) in new_addrs.iter().filter(|a| !cur.contains(a)) {
-                match addr {
-                    IpAddr::V4(v4) => binding.dev.add_address_v4(*v4, *prefix)?,
-                    IpAddr::V6(v6) => binding.dev.add_address_v6(*v6, *prefix)?,
-                }
+                crate::tun_platform::add_address(&binding.dev, *addr, *prefix)?;
             }
             for (addr, _prefix) in binding.addrs.iter().filter(|a| !want.contains(a)) {
-                binding.dev.remove_address(*addr)?;
+                crate::tun_platform::remove_address(&binding.dev, *addr)?;
             }
             binding.addrs = new_addrs.to_vec();
             log::info!("[client] address set updated: {}", fmt_addrs(new_addrs));
         }
     }
     Ok(())
-}
-
-fn create_tun(
-    addrs: &[(IpAddr, u8)],
-    config: &IpClientConfig,
-) -> Result<AsyncDevice, Box<dyn std::error::Error + Send + Sync>> {
-    let mut builder = tun_rs::DeviceBuilder::new().mtu(config.mtu);
-    // On macOS/BSD, tun-rs installs a host route for the assigned /32 (or /128)
-    // whose gateway is the address itself; macOS rejects it with EADDRNOTAVAIL,
-    // logging a noisy but harmless warning. We never want that route — traffic
-    // is steered into the tunnel by routes the operator adds explicitly. Linux
-    // has no such auto-route behavior (and `associate_route` is not defined
-    // there), so this switch is macOS/BSD-only.
-    #[cfg(any(
-        target_os = "macos",
-        target_os = "freebsd",
-        target_os = "openbsd",
-        target_os = "netbsd"
-    ))]
-    {
-        builder = builder.associate_route(false);
-    }
-    for (addr, prefix_len) in addrs {
-        builder = match addr {
-            IpAddr::V4(v4) => builder.ipv4(*v4, *prefix_len, None),
-            IpAddr::V6(v6) => builder.ipv6(*v6, *prefix_len),
-        };
-    }
-    if let Some(name) = &config.tun_name {
-        builder = builder.name(name);
-    }
-    Ok(builder.build_async()?)
 }
 
 /// Render an assignment set like `10.99.0.2/32, 2001:db8:1::2/128`.

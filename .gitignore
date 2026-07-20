@@ -1,1 +1,5 @@
 /target
+
+# iOS/tvOS xcframework build products (produced by build-xcframework.sh)
+/MasqueTunnel.xcframework
+/build
