@@ -96,6 +96,12 @@ enum Commands {
         /// TUN device name (Linux: any; macOS: utunN or omit for automatic)
         #[arg(long)]
         tun_name: Option<String>,
+
+        /// Take over the host's default route when the proxy advertises a full
+        /// tunnel (0.0.0.0/0 or ::/0): pins the proxy address to the real
+        /// gateway and installs a split default. Reverted on exit (Ctrl-C).
+        #[arg(long)]
+        redirect_gateway: bool,
     },
 
     /// Run as MASQUE proxy server (CONNECT-UDP always; CONNECT-IP with --ip-pool)
@@ -173,6 +179,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             insecure,
             mtu,
             tun_name,
+            redirect_gateway,
         } => {
             ip_client::run(ip_client::IpClientConfig {
                 proxy_url,
@@ -182,6 +189,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 ca,
                 mtu,
                 tun_name,
+                redirect_gateway,
             })
             .await
         }
