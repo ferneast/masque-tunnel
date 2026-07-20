@@ -152,7 +152,13 @@ enum Commands {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let _ = log::set_logger(&STDERR_LOGGER);
-    log::set_max_level(log::LevelFilter::Info);
+    // Honor RUST_LOG (default Info) so quiche's frame-level trace can be enabled
+    // for diagnostics without a rebuild.
+    let level = std::env::var("RUST_LOG")
+        .ok()
+        .and_then(|s| s.parse::<log::LevelFilter>().ok())
+        .unwrap_or(log::LevelFilter::Info);
+    log::set_max_level(level);
 
     let cli = Cli::parse();
 

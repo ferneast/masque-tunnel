@@ -48,12 +48,39 @@ pub(crate) fn server_quic_settings() -> QuicSettings {
     qs.enable_dgram = true;
     qs.dgram_recv_max_queue_len = 65_536;
     qs.dgram_send_max_queue_len = 65_536;
-    // quiche defaults max_send_udp_payload_size to 1200, leaving only ~1157
-    // bytes of writable DATAGRAM — smaller than a WireGuard data packet, which
-    // then gets silently dropped (the handshake fits, bulk data does not).
-    // Raise it to fill a 1500-MTU path (1452 + 28 IP/UDP = 1480, under PPPoE's
-    // 1492) so a full-size WG packet fits in one DATAGRAM.
+    // DATAGRAM sizing has three independent caps; the WireGuard regression came
+    // from the FIRST one, which the quinn stack left wide open:
+    //   1. max_recv_udp_payload_size — advertised to the peer as the QUIC
+    //      max_udp_payload_size transport parameter. quiche's send path does
+    //      `.min(peer.max_udp_payload_size)`, so the peer will NOT send us a
+    //      datagram larger than this. tokio-quiche defaults it to 1350, so a
+    //      full-size WireGuard data packet from the client was capped and
+    //      silently dropped. Raise to 1452.
+    //   2. max_send_udp_payload_size — the ceiling on what WE send. Raise to
+    //      1452 (a 1500-byte path minus IP/UDP; still under PPPoE's 1492).
+    //   3. the live path MTU (max_datagram_size), which starts at QUIC's 1200
+    //      floor and only grows via PMTUD. Enable it so the path climbs toward
+    //      1452 (quinn got this from initial_mtu(1350) + MTU discovery).
+    // The small WG handshake fit under 1350; bulk data did not — exactly
+    // "handshake works, no data flows".
+    qs.max_recv_udp_payload_size = 1452;
     qs.max_send_udp_payload_size = 1452;
+    qs.discover_path_mtu = true;
+    // THE quiche-migration regression: quiche defaults grease=true, and its h3
+    // layer injects two GREASE (reserved) frames on the FIRST stream it writes.
+    // For a CONNECT-UDP response that stream is 0, so the reserved frames land
+    // BEFORE the 200 HEADERS. Apple's NWConnection relay expects the CONNECT
+    // response stream to open with HEADERS and never reaches `.ready` after
+    // seeing them first — the tunnel establishes server-side but the client
+    // never sends/receives data ("handshake works, no data flows"). The old
+    // quinn/h3 stack only greased the SETTINGS, leaving the response stream
+    // clean. Disable grease so the 200 is the first frame on the stream.
+    qs.grease = false;
+    // Keep PMTUD ON: it probes the real path MTU and never sends a DATAGRAM
+    // larger than the path can carry, so bulk traffic doesn't hit the path-MTU
+    // black-hole → packet-loss → BBR-backoff spiral that tanks throughput.
+    // Disabling it to win a few MTU bytes trades away far more in throughput.
+    qs.discover_path_mtu = true;
     qs.max_idle_timeout = Some(Duration::from_secs(30));
     qs
 }
@@ -273,10 +300,17 @@ async fn handle_request(
         return;
     };
 
-    // 200 for CONNECT-UDP: no FIN — the stream stays open for datagrams.
+    // 200 for CONNECT-UDP: no FIN — the stream stays open for datagrams. The
+    // Capsule-Protocol header (RFC 9297 §3.2) is required on datagram-carrying
+    // responses; Apple's NWConnection relay refuses to enable HTTP Datagrams
+    // without it (our own lax client works either way, which hid the gap —
+    // CONNECT-IP already sent it, CONNECT-UDP did not).
     let _ = send
         .send(OutboundFrame::Headers(
-            vec![Header::new(b":status", b"200")],
+            vec![
+                Header::new(b":status", b"200"),
+                Header::new(b"capsule-protocol", b"?1"),
+            ],
             None,
         ))
         .await;

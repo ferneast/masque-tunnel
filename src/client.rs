@@ -47,9 +47,18 @@ pub(crate) fn client_quic_settings(insecure: bool) -> QuicSettings {
     qs.enable_dgram = true;
     qs.dgram_recv_max_queue_len = 65_536;
     qs.dgram_send_max_queue_len = 65_536;
-    // See server.rs: raise from quiche's 1200 default so a full-size WireGuard
-    // packet fits in one QUIC DATAGRAM instead of being silently dropped.
+    // See server.rs for the three DATAGRAM size caps. The dominant one is
+    // max_recv_udp_payload_size: it is advertised to the peer, and quiche's
+    // send path caps on the peer's value, so tokio-quiche's 1350 default makes
+    // the *server* drop our large upstream datagrams regardless of the send
+    // ceiling or PMTUD. Raise all three so full-size WireGuard packets fit.
+    qs.max_recv_udp_payload_size = 1452;
     qs.max_send_udp_payload_size = 1452;
+    qs.discover_path_mtu = true;
+    // See server.rs: quiche's h3 GREASE frames on the response stream break
+    // Apple's NWConnection relay. Disable grease on the client too for symmetry
+    // and so we never emit reserved frames ahead of HEADERS to a strict peer.
+    qs.grease = false;
     qs.max_idle_timeout = Some(Duration::from_secs(30));
     // verify_peer defaults to false in tokio-quiche; only enable it when the
     // caller did not ask for --insecure. Custom-CA (--ca) support still needs
