@@ -64,12 +64,69 @@ pub fn decode_varint(buf: &[u8]) -> Option<(u64, usize)> {
 /// Encode a DATAGRAM payload with Quarter Stream ID and Context ID = 0.
 /// Returns Bytes via BytesMut::freeze (single allocation, O(1) handoff).
 pub fn encode_datagram(stream_id: u64, payload: &[u8]) -> Bytes {
-    // QSID varint is at most 8 bytes; context id is 1 byte; rest is payload.
+    encode_datagram_ctx(stream_id, 0, payload)
+}
+
+/// Encode a DATAGRAM payload with an explicit Context ID. Context 0 carries the
+/// proxied payload; the CONNECT-IP client uses a non-zero context for an empty
+/// ack-eliciting keepalive that the proxy drops instead of forwarding.
+pub fn encode_datagram_ctx(stream_id: u64, context_id: u64, payload: &[u8]) -> Bytes {
     let mut buf = BytesMut::with_capacity(9 + payload.len());
     put_varint(&mut buf, stream_id / 4);
-    buf.put_u8(0x00); // Context ID = 0
+    put_varint(&mut buf, context_id);
     buf.put_slice(payload);
     buf.freeze()
+}
+
+/// Decrement an IP packet's TTL (IPv4) / Hop Limit (IPv6) in place, as required
+/// upon encapsulating a forwarded packet into an HTTP Datagram (RFC 9484 §7.1:
+/// "the Hop Count is decremented right before an IP packet is transmitted in an
+/// HTTP Datagram"). Only the CONNECT-IP client's upstream path needs this: the
+/// server relies on the kernel's IP-forwarding to decrement transited packets,
+/// so decrementing there too would double-count.
+///
+/// Returns `true` if the packet may be forwarded, or `false` if the hop count
+/// is exhausted (was 0 or 1) and the packet must be dropped. Buffers that are
+/// not recognizable IPv4/IPv6 are left unchanged and forwarded (`true`) — this
+/// only ever sees packets read off the TUN, which are transited traffic. For
+/// IPv4 the header checksum is recomputed over the header length (IHL).
+pub fn decrement_hop_limit(pkt: &mut [u8]) -> bool {
+    match pkt.first().map(|b| b >> 4) {
+        Some(4) if pkt.len() >= 20 => {
+            let ihl = ((pkt[0] & 0x0f) as usize) * 4;
+            if ihl < 20 || pkt.len() < ihl {
+                return false; // malformed IPv4 header
+            }
+            if pkt[8] <= 1 {
+                return false; // TTL would reach 0
+            }
+            pkt[8] -= 1;
+            // Recompute the header checksum (RFC 1071) over the full IHL so
+            // options, if any, are covered.
+            pkt[10] = 0;
+            pkt[11] = 0;
+            let mut sum = 0u32;
+            let mut i = 0;
+            while i + 1 < ihl {
+                sum += u16::from_be_bytes([pkt[i], pkt[i + 1]]) as u32;
+                i += 2;
+            }
+            while sum >> 16 != 0 {
+                sum = (sum & 0xffff) + (sum >> 16);
+            }
+            let ck = !(sum as u16);
+            pkt[10..12].copy_from_slice(&ck.to_be_bytes());
+            true
+        }
+        Some(6) if pkt.len() >= 40 => {
+            if pkt[7] <= 1 {
+                return false; // Hop Limit would reach 0
+            }
+            pkt[7] -= 1;
+            true
+        }
+        _ => true, // not a recognized IP packet; forward unchanged
+    }
 }
 
 /// Decode a DATAGRAM payload. Returns (stream_id, udp_payload).
@@ -291,5 +348,63 @@ mod tests {
         let wire = encode_datagram(8, b"pkt");
         let (sid, ctx, payload) = decode_datagram_ctx(&wire).unwrap();
         assert_eq!((sid, ctx, payload), (8, 0, b"pkt".as_slice()));
+        // Non-zero context (keepalive) round-trips too.
+        let ka = encode_datagram_ctx(8, 1, &[]);
+        let (sid, ctx, payload) = decode_datagram_ctx(&ka).unwrap();
+        assert_eq!((sid, ctx, payload), (8, 1, b"".as_slice()));
+    }
+
+    #[test]
+    fn hop_limit_ipv4_decrements_and_fixes_checksum() {
+        // Minimal IPv4 header, TTL 64, protocol UDP, valid checksum.
+        let mut pkt = vec![0u8; 20];
+        pkt[0] = 0x45;
+        pkt[2] = 0x00;
+        pkt[3] = 20; // total length
+        pkt[8] = 64; // TTL
+        pkt[9] = 17; // UDP
+        pkt[12..16].copy_from_slice(&[10, 99, 0, 2]);
+        pkt[16..20].copy_from_slice(&[1, 1, 1, 1]);
+        // Set a correct starting checksum.
+        assert!(decrement_hop_limit(&mut pkt));
+        assert_eq!(pkt[8], 63); // TTL decremented
+        // Checksum must verify (one's-complement sum over the header == 0).
+        let mut sum = 0u32;
+        for c in pkt[..20].chunks_exact(2) {
+            sum += u16::from_be_bytes([c[0], c[1]]) as u32;
+        }
+        while sum >> 16 != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        assert_eq!(sum as u16, 0xffff); // valid checksum sums to 0xffff before complement
+    }
+
+    #[test]
+    fn hop_limit_drops_when_exhausted() {
+        let mut v4 = vec![0u8; 20];
+        v4[0] = 0x45;
+        v4[8] = 1; // TTL 1 → would reach 0
+        assert!(!decrement_hop_limit(&mut v4));
+
+        let mut v6 = vec![0u8; 40];
+        v6[0] = 0x60;
+        v6[7] = 1; // Hop Limit 1 → would reach 0
+        assert!(!decrement_hop_limit(&mut v6));
+    }
+
+    #[test]
+    fn hop_limit_ipv6_decrements() {
+        let mut pkt = vec![0u8; 40];
+        pkt[0] = 0x60;
+        pkt[7] = 64; // Hop Limit
+        assert!(decrement_hop_limit(&mut pkt));
+        assert_eq!(pkt[7], 63);
+    }
+
+    #[test]
+    fn hop_limit_passes_through_non_ip() {
+        let mut junk = vec![0xff, 0x00, 0x11];
+        assert!(decrement_hop_limit(&mut junk)); // forwarded unchanged
+        assert_eq!(junk, vec![0xff, 0x00, 0x11]);
     }
 }

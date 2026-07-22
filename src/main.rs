@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use masque_tunnel::{client, server};
+use masque_tunnel::{client, ip_client, server};
 
 /// Minimal stderr logger.
 struct StderrLogger;
@@ -66,7 +66,51 @@ enum Commands {
         insecure: bool,
     },
 
-    /// Run as MASQUE CONNECT-UDP proxy server
+    /// Run as MASQUE CONNECT-IP client: a full-tunnel VPN over a local TUN
+    /// device (requires root to create the TUN)
+    ClientIp {
+        /// MASQUE proxy server URL (e.g. https://proxy.example.com:443)
+        #[arg(long, short)]
+        proxy_url: String,
+
+        /// TLS server name (SNI) override
+        #[arg(long)]
+        sni: Option<String>,
+
+        /// Bearer token for Proxy-Authorization header
+        #[arg(long)]
+        auth_token: Option<String>,
+
+        /// CA certificate PEM file for server verification
+        #[arg(long)]
+        ca: Option<String>,
+
+        /// Skip server certificate verification
+        #[arg(long)]
+        insecure: bool,
+
+        /// TUN device MTU; must fit in a QUIC DATAGRAM on the proxy path
+        #[arg(long, default_value_t = 1280)]
+        mtu: u16,
+
+        /// TUN device name (Linux: any; macOS: utunN or omit for automatic)
+        #[arg(long)]
+        tun_name: Option<String>,
+
+        /// Take over the host's default route when the proxy advertises a full
+        /// tunnel (0.0.0.0/0 or ::/0): pins the proxy address to the real
+        /// gateway and installs a split default. Reverted on exit (Ctrl-C).
+        #[arg(long)]
+        redirect_gateway: bool,
+
+        /// Set the system DNS resolver(s) while the tunnel is up (repeatable),
+        /// restored on exit. Independent of --redirect-gateway; logs a leak
+        /// warning if the resolver is not routed through the tunnel.
+        #[arg(long)]
+        dns: Vec<std::net::IpAddr>,
+    },
+
+    /// Run as MASQUE proxy server (CONNECT-UDP always; CONNECT-IP with --ip-pool)
     Server {
         /// Address to listen on (e.g. [::]:443)
         #[arg(long, short, default_value = "[::]:443")]
@@ -133,6 +177,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 auth_token,
                 insecure,
                 ca,
+            })
+            .await
+        }
+        Commands::ClientIp {
+            proxy_url,
+            sni,
+            auth_token,
+            ca,
+            insecure,
+            mtu,
+            tun_name,
+            redirect_gateway,
+            dns,
+        } => {
+            ip_client::run(ip_client::IpClientConfig {
+                proxy_url,
+                sni,
+                auth_token,
+                insecure,
+                ca,
+                mtu,
+                tun_name,
+                redirect_gateway,
+                dns,
+                tun_fd: None,
+                events: None,
             })
             .await
         }
