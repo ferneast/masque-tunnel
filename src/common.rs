@@ -3,6 +3,16 @@ use bytes::{BufMut, Bytes, BytesMut};
 /// Well-known URI prefix for CONNECT-UDP (RFC 9298).
 pub const CONNECT_UDP_PATH: &str = "/.well-known/masque/udp";
 
+/// Well-known URI prefix for CONNECT-IP (RFC 9484).
+pub const CONNECT_IP_PATH: &str = "/.well-known/masque/ip";
+
+/// Largest inner IP packet one HTTP Datagram can carry before we reply with an
+/// ICMP Packet Too Big (RFC 9484 §7.1). Kept below the datagram payload
+/// available at the initial ~1350-byte max UDP payload (leaving room for QUIC,
+/// DATAGRAM-frame, quarter-stream-id, and context-id overhead) and at/above
+/// the IPv6 minimum MTU of 1280.
+pub const TUNNEL_IP_MTU: u32 = 1300;
+
 /// Append a QUIC variable-length integer (RFC 9000, Section 16) to a buffer.
 pub fn put_varint(buf: &mut BytesMut, value: u64) {
     if value < 64 {
@@ -64,11 +74,19 @@ pub fn encode_datagram(stream_id: u64, payload: &[u8]) -> Bytes {
 
 /// Decode a DATAGRAM payload. Returns (stream_id, udp_payload).
 pub fn decode_datagram(buf: &[u8]) -> Option<(u64, &[u8])> {
+    let (stream_id, _, payload) = decode_datagram_ctx(buf)?;
+    Some((stream_id, payload))
+}
+
+/// Decode a DATAGRAM payload keeping the context ID:
+/// (stream_id, context_id, payload). RFC 9298/9484 reserve Context ID 0 for
+/// the proxied payload; callers must drop datagrams with any other value.
+pub fn decode_datagram_ctx(buf: &[u8]) -> Option<(u64, u64, &[u8])> {
     let (qsid, qsid_len) = decode_varint(buf)?;
     let stream_id = qsid * 4;
     let remaining = &buf[qsid_len..];
-    let (_, ctx_len) = decode_varint(remaining)?;
-    Some((stream_id, &remaining[ctx_len..]))
+    let (ctx, ctx_len) = decode_varint(remaining)?;
+    Some((stream_id, ctx, &remaining[ctx_len..]))
 }
 
 /// Percent-decode an ASCII URI component (RFC 3986). Invalid `%` escapes are
@@ -149,6 +167,24 @@ pub fn parse_connect_udp_path(path: &str) -> Option<(String, u16)> {
     Some((host, port))
 }
 
+/// Parse a CONNECT-IP path `/.well-known/masque/ip/{target}/{ipproto}/` into
+/// its percent-decoded (target, ipproto) segments (RFC 9484 §4.1).
+///
+/// Both variables may be the wildcard `*`. Validation of scoped targets and
+/// protocol numbers is left to the caller; this only recovers the segments.
+pub fn parse_connect_ip_path(path: &str) -> Option<(String, String)> {
+    let prefix = format!("{}/", CONNECT_IP_PATH);
+    let stripped = path.strip_prefix(&prefix)?;
+    let stripped = stripped.strip_suffix('/').unwrap_or(stripped);
+    let mut parts = stripped.split('/');
+    let target = parts.next()?;
+    let ipproto = parts.next()?;
+    if parts.next().is_some() || target.is_empty() || ipproto.is_empty() {
+        return None;
+    }
+    Some((percent_decode(target), percent_decode(ipproto)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,5 +263,33 @@ mod tests {
     #[test]
     fn rejects_missing_port() {
         assert_eq!(p("/.well-known/masque/udp/example.com/"), None);
+    }
+
+    #[test]
+    fn parses_connect_ip_wildcards() {
+        assert_eq!(
+            parse_connect_ip_path("/.well-known/masque/ip/*/*/"),
+            Some(("*".into(), "*".into()))
+        );
+        // Trailing slash is optional in the wild.
+        assert_eq!(
+            parse_connect_ip_path("/.well-known/masque/ip/*/*"),
+            Some(("*".into(), "*".into()))
+        );
+    }
+
+    #[test]
+    fn rejects_connect_ip_bad_paths() {
+        assert_eq!(parse_connect_ip_path("/.well-known/masque/ip/*/"), None);
+        assert_eq!(parse_connect_ip_path("/.well-known/masque/ip/*/*/x/"), None);
+        assert_eq!(parse_connect_ip_path("/.well-known/masque/udp/h/443/"), None);
+    }
+
+    #[test]
+    fn datagram_ctx_roundtrip() {
+        // Stream ID 8 → QSID 2; context 0; payload preserved.
+        let wire = encode_datagram(8, b"pkt");
+        let (sid, ctx, payload) = decode_datagram_ctx(&wire).unwrap();
+        assert_eq!((sid, ctx, payload), (8, 0, b"pkt".as_slice()));
     }
 }

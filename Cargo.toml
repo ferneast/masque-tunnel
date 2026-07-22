@@ -1,8 +1,8 @@
 [package]
 name = "masque-tunnel"
-version = "0.9.8"
+version = "0.10.0"
 edition = "2021"
-description = "MASQUE CONNECT-UDP tunnel (RFC 9298)"
+description = "MASQUE tunnel on quinn+h3: CONNECT-UDP (RFC 9298) and CONNECT-IP (RFC 9484)"
 
 [lib]
 name = "masque_tunnel"
@@ -24,6 +24,8 @@ clap = { version = "4", features = ["derive"] }
 bytes = "1"
 url = "2"
 log = "0.4"
+# CONNECT-IP server TUN device (same crate/version as the quiche stack uses).
+tun-rs = { version = "2.8.7", features = ["async_tokio"] }
 
 [profile.release]
 lto = "fat"

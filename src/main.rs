@@ -83,13 +83,35 @@ enum Commands {
         /// Required Bearer token for client authentication
         #[arg(long)]
         auth_token: Option<String>,
+
+        /// Enable CONNECT-IP (RFC 9484) with this IPv4 pool (CIDR, e.g. 10.99.0.0/24)
+        #[arg(long)]
+        ip_pool: Option<String>,
+
+        /// Enable CONNECT-IP with this IPv6 pool (CIDR, e.g. 2001:db8:1::/64)
+        #[arg(long)]
+        ip6_pool: Option<String>,
+
+        /// MTU of the CONNECT-IP TUN device
+        #[arg(long, default_value_t = 1280)]
+        ip_mtu: u16,
+
+        /// Name for the CONNECT-IP TUN device (Linux: any; macOS: utunN)
+        #[arg(long)]
+        ip_tun_name: Option<String>,
     },
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let _ = log::set_logger(&STDERR_LOGGER);
-    log::set_max_level(log::LevelFilter::Info);
+    // Honor RUST_LOG as a plain level name (e.g. trace) so quinn/h3 internals
+    // can be inspected without a rebuild; default to Info.
+    let level = std::env::var("RUST_LOG")
+        .ok()
+        .and_then(|v| v.parse::<log::LevelFilter>().ok())
+        .unwrap_or(log::LevelFilter::Info);
+    log::set_max_level(level);
 
     let cli = Cli::parse();
 
@@ -119,12 +141,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             cert,
             key,
             auth_token,
+            ip_pool,
+            ip6_pool,
+            ip_mtu,
+            ip_tun_name,
         } => {
             server::run(server::ServerConfig {
                 listen,
                 cert,
                 key,
                 auth_token,
+                ip_pool,
+                ip6_pool,
+                ip_mtu,
+                ip_tun_name,
             })
             .await
         }
