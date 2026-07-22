@@ -267,6 +267,21 @@ mod tests {
     }
 
     #[test]
+    fn hostname_roundtrips_and_is_not_ip_literal() {
+        // A hostname must survive encode → path → parse untouched, and must not
+        // be misclassified as an IP literal — otherwise the server would connect
+        // to it directly instead of resolving it via DNS.
+        let encoded = encode_target_host("host1.example.com");
+        let path = format!("{CONNECT_UDP_PATH}/{encoded}/7521/");
+        let (host, port) = parse_connect_udp_path(&path).unwrap();
+        assert_eq!((host.as_str(), port), ("host1.example.com", 7521));
+        assert!(
+            host.parse::<std::net::IpAddr>().is_err(),
+            "hostname must NOT be treated as an IP literal"
+        );
+    }
+
+    #[test]
     fn parses_percent_encoded_ipv6() {
         // RFC 9298 form: colons encoded as %3A, no brackets.
         // Address from the RFC 3849 documentation prefix (2001:db8::/32).
