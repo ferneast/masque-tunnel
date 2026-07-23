@@ -56,7 +56,15 @@ struct FfiLogger;
 
 impl log::Log for FfiLogger {
     fn enabled(&self, metadata: &log::Metadata) -> bool {
-        metadata.level() <= log::Level::Debug
+        // Forward this crate's own lines up to Debug, but only Warn+ from
+        // dependencies. quinn's `log` feature (and h3 / rustls) emit an
+        // extremely chatty per-poll stream (e.g. "drive; id=0") at Debug/Trace
+        // that would otherwise flood the host log across the FFI boundary.
+        if metadata.target().starts_with("masque_tunnel") {
+            metadata.level() <= log::Level::Debug
+        } else {
+            metadata.level() <= log::Level::Warn
+        }
     }
     fn log(&self, record: &log::Record) {
         if !self.enabled(record.metadata()) {
