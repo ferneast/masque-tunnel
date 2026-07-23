@@ -38,6 +38,10 @@ pub struct IpConfig {
     pub mtu: u16,
     /// Optional TUN device name (Linux: any; macOS: `utunN`).
     pub tun_name: Option<String>,
+    /// Routes to advertise to clients via ROUTE_ADVERTISEMENT, as CIDRs.
+    /// Empty means advertise a full tunnel (0.0.0.0/0 and/or ::/0 for each
+    /// assigned family). Loaded once at startup (see `parse_routes_file`).
+    pub advertised_routes: Vec<(IpAddr, u8)>,
 }
 
 /// Allocates client host addresses from a v4 or v6 pool, skipping the
@@ -123,6 +127,8 @@ pub struct IpTunState {
     pool_v4: Option<Mutex<AddressPool>>,
     pool_v6: Option<Mutex<AddressPool>>,
     routes: RwLock<HashMap<IpAddr, DownstreamFlow>>,
+    /// Routes advertised via ROUTE_ADVERTISEMENT (CIDRs). Empty = full tunnel.
+    advertised_routes: Vec<(IpAddr, u8)>,
 }
 
 impl IpTunState {
@@ -199,6 +205,112 @@ fn parse_cidr(s: &str, want_v6: bool) -> Result<(IpAddr, u8), String> {
         }
         Ok((IpAddr::V6(v6), len))
     }
+}
+
+/// Load the `--ip-routes-file`: one CIDR per line, with `#` comments and blank
+/// lines ignored. Host bits are tolerated (masked off when converted to a
+/// range). Fails fast on a malformed line so a bad config never silently
+/// advertises the wrong tunnel.
+pub fn parse_routes_file(
+    path: &str,
+) -> Result<Vec<(IpAddr, u8)>, Box<dyn std::error::Error + Send + Sync>> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read --ip-routes-file {path}: {e}"))?;
+    let mut out = Vec::new();
+    for (i, raw) in text.lines().enumerate() {
+        // Strip trailing/inline comments and surrounding whitespace.
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let ln = i + 1;
+        let (addr, len) = line
+            .split_once('/')
+            .ok_or_else(|| format!("{path}:{ln}: not a CIDR (expected addr/len): {line}"))?;
+        let net: IpAddr = addr
+            .trim()
+            .parse()
+            .map_err(|e| format!("{path}:{ln}: invalid address {addr}: {e}"))?;
+        let prefix: u8 = len
+            .trim()
+            .parse()
+            .map_err(|e| format!("{path}:{ln}: invalid prefix {len}: {e}"))?;
+        let max = if net.is_ipv6() { 128 } else { 32 };
+        if prefix > max {
+            return Err(format!("{path}:{ln}: prefix /{prefix} exceeds /{max}").into());
+        }
+        out.push((net, prefix));
+    }
+    Ok(out)
+}
+
+/// Convert a CIDR (network/prefix, host bits ignored) to the inclusive
+/// [start, end] IpAddressRange the ROUTE_ADVERTISEMENT capsule carries, for all
+/// protocols (ip_proto 0).
+fn cidr_to_range(net: IpAddr, prefix: u8) -> IpAddressRange {
+    match net {
+        IpAddr::V4(v4) => {
+            let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+            let base = u32::from(v4) & mask;
+            IpAddressRange {
+                start: IpAddr::V4(Ipv4Addr::from(base)),
+                end: IpAddr::V4(Ipv4Addr::from(base | !mask)),
+                ip_proto: 0,
+            }
+        }
+        IpAddr::V6(v6) => {
+            let mask = if prefix == 0 { 0 } else { u128::MAX << (128 - prefix) };
+            let base = u128::from(v6) & mask;
+            IpAddressRange {
+                start: IpAddr::V6(Ipv6Addr::from(base)),
+                end: IpAddr::V6(Ipv6Addr::from(base | !mask)),
+                ip_proto: 0,
+            }
+        }
+    }
+}
+
+/// Build the ROUTE_ADVERTISEMENT range set for a session (RFC 9484 §4.7.3:
+/// each advertisement carries the complete route set, ordered ascending with
+/// IPv4 before IPv6). With no configured routes this advertises a full tunnel
+/// per assigned family; otherwise it advertises the configured CIDRs, but only
+/// for families the client actually holds an address in (a route it cannot
+/// source is useless).
+fn route_ranges(advertised: &[(IpAddr, u8)], assigned: &[(IpAddr, u8)]) -> Vec<IpAddressRange> {
+    let has_v4 = assigned.iter().any(|(ip, _)| ip.is_ipv4());
+    let has_v6 = assigned.iter().any(|(ip, _)| ip.is_ipv6());
+
+    if advertised.is_empty() {
+        let mut ranges = Vec::new();
+        if has_v4 {
+            ranges.push(IpAddressRange {
+                start: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                end: IpAddr::V4(Ipv4Addr::BROADCAST),
+                ip_proto: 0,
+            });
+        }
+        if has_v6 {
+            ranges.push(IpAddressRange {
+                start: IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+                end: IpAddr::V6(Ipv6Addr::from(u128::MAX)),
+                ip_proto: 0,
+            });
+        }
+        return ranges;
+    }
+
+    let mut v4: Vec<IpAddressRange> = Vec::new();
+    let mut v6: Vec<IpAddressRange> = Vec::new();
+    for (net, prefix) in advertised {
+        match net {
+            IpAddr::V4(_) if has_v4 => v4.push(cidr_to_range(*net, *prefix)),
+            IpAddr::V6(_) if has_v6 => v6.push(cidr_to_range(*net, *prefix)),
+            _ => {} // client has no address in this family; the route is useless
+        }
+    }
+    v4.sort_by_key(|r| r.start);
+    v6.sort_by_key(|r| r.start);
+    v4.into_iter().chain(v6).collect()
 }
 
 /// Source address of an IP packet (v4 or v6), or `None` if malformed.
@@ -285,7 +397,14 @@ pub fn init(config: &IpConfig) -> Result<Arc<IpTunState>, Box<dyn std::error::Er
         pool_v4: v4.map(|(net, prefix)| Mutex::new(AddressPool::new(net, prefix))),
         pool_v6: v6.map(|(net, prefix)| Mutex::new(AddressPool::new(net, prefix))),
         routes: RwLock::new(HashMap::new()),
+        advertised_routes: config.advertised_routes.clone(),
     });
+    if !state.advertised_routes.is_empty() {
+        log::info!(
+            "[server] CONNECT-IP advertising {} configured route(s) (split tunnel)",
+            state.advertised_routes.len()
+        );
+    }
 
     // Downstream router: TUN -> a QUIC DATAGRAM on the connection of the
     // session that owns the destination address.
@@ -472,22 +591,7 @@ pub async fn handle_ip_request(
             })
             .collect::<Vec<_>>(),
     );
-    // Ranges must be ordered by IP version (v4 before v6) per §4.7.3.
-    let mut ranges = Vec::new();
-    if assigned.iter().any(|(ip, _)| ip.is_ipv4()) {
-        ranges.push(IpAddressRange {
-            start: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-            end: IpAddr::V4(Ipv4Addr::BROADCAST),
-            ip_proto: 0,
-        });
-    }
-    if assigned.iter().any(|(ip, _)| ip.is_ipv6()) {
-        ranges.push(IpAddressRange {
-            start: IpAddr::V6(Ipv6Addr::UNSPECIFIED),
-            end: IpAddr::V6(Ipv6Addr::from(u128::MAX)),
-            ip_proto: 0,
-        });
-    }
+    let ranges = route_ranges(&state.advertised_routes, &assigned);
     let route_caps = encode_route_advertisement(&ranges);
     if stream.send_data(assign).await.is_err() || stream.send_data(route_caps).await.is_err() {
         log::error!("[server] Failed to send CONNECT-IP capsules");
@@ -718,6 +822,59 @@ mod tests {
         assert_eq!(packet_src(&pkt), Some("10.99.0.2".parse().unwrap()));
         assert_eq!(packet_dst(&pkt), Some("1.1.1.1".parse().unwrap()));
         assert_eq!(packet_src(&[0x45u8; 10]), None); // truncated
+    }
+
+    #[test]
+    fn cidr_to_range_v4_v6() {
+        // /16 → [10.8.0.0, 10.8.255.255]
+        let r = cidr_to_range("10.8.0.0".parse().unwrap(), 16);
+        assert_eq!(r.start, "10.8.0.0".parse::<IpAddr>().unwrap());
+        assert_eq!(r.end, "10.8.255.255".parse::<IpAddr>().unwrap());
+        // host bits are masked off: 10.8.1.2/16 → same range
+        let r2 = cidr_to_range("10.8.1.2".parse().unwrap(), 16);
+        assert_eq!((r2.start, r2.end), (r.start, r.end));
+        // /32 → single host
+        let h = cidr_to_range("1.2.3.4".parse().unwrap(), 32);
+        assert_eq!(h.start, h.end);
+        // v6 /48
+        let v6 = cidr_to_range("2001:db8:abcd::".parse().unwrap(), 48);
+        assert_eq!(v6.start, "2001:db8:abcd::".parse::<IpAddr>().unwrap());
+        assert_eq!(
+            v6.end,
+            "2001:db8:abcd:ffff:ffff:ffff:ffff:ffff".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn route_ranges_default_is_full_tunnel() {
+        let assigned = vec![
+            ("10.99.0.2".parse().unwrap(), 32u8),
+            ("2001:db8::2".parse().unwrap(), 128u8),
+        ];
+        let r = route_ranges(&[], &assigned);
+        assert_eq!(r.len(), 2);
+        assert!(is_full_v4(&r[0]) && r[1].start.is_ipv6());
+    }
+
+    #[test]
+    fn route_ranges_configured_ordered_and_family_filtered() {
+        // v4-only client: v6 advertised route must be dropped; v4 sorted ascending.
+        let assigned = vec![("10.99.0.2".parse().unwrap(), 32u8)];
+        let advertised = vec![
+            ("172.16.0.0".parse().unwrap(), 12u8),
+            ("10.8.0.0".parse().unwrap(), 16u8),
+            ("2001:db8::".parse().unwrap(), 32u8), // dropped (no v6 address)
+        ];
+        let r = route_ranges(&advertised, &assigned);
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[0].start, "10.8.0.0".parse::<IpAddr>().unwrap()); // ascending
+        assert_eq!(r[1].start, "172.16.0.0".parse::<IpAddr>().unwrap());
+        assert!(r.iter().all(|x| x.start.is_ipv4()));
+    }
+
+    fn is_full_v4(r: &IpAddressRange) -> bool {
+        r.start == "0.0.0.0".parse::<IpAddr>().unwrap()
+            && r.end == "255.255.255.255".parse::<IpAddr>().unwrap()
     }
 
     #[test]

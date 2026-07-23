@@ -143,6 +143,13 @@ enum Commands {
         /// Name for the CONNECT-IP TUN device (Linux: any; macOS: utunN)
         #[arg(long)]
         ip_tun_name: Option<String>,
+
+        /// File of routes to advertise to CONNECT-IP clients: one CIDR per
+        /// line (# comments and blank lines ignored), IPv4/IPv6 mixed. Clients
+        /// route only these prefixes through the tunnel (split tunnel). Omit to
+        /// advertise a full tunnel (0.0.0.0/0 and/or ::/0).
+        #[arg(long)]
+        ip_routes_file: Option<String>,
     },
 }
 
@@ -215,6 +222,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             ip6_pool,
             ip_mtu,
             ip_tun_name,
+            ip_routes_file,
         } => {
             server::run(server::ServerConfig {
                 listen,
@@ -225,6 +233,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 ip6_pool,
                 ip_mtu,
                 ip_tun_name,
+                ip_routes_file,
             })
             .await
         }

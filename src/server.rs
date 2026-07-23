@@ -24,6 +24,9 @@ pub struct ServerConfig {
     pub ip_mtu: u16,
     /// Optional name for the CONNECT-IP TUN device.
     pub ip_tun_name: Option<String>,
+    /// Optional file of routes to advertise to CONNECT-IP clients (one CIDR
+    /// per line). None/absent advertises a full tunnel.
+    pub ip_routes_file: Option<String>,
 }
 
 /// Run the MASQUE CONNECT-UDP proxy server.
@@ -61,11 +64,16 @@ pub async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error +
 
     // CONNECT-IP is opt-in: it needs a TUN device (root) and an address pool.
     let ip_state = if config.ip_pool.is_some() || config.ip6_pool.is_some() {
+        let advertised_routes = match &config.ip_routes_file {
+            Some(path) => ip_server::parse_routes_file(path)?,
+            None => Vec::new(),
+        };
         Some(ip_server::init(&ip_server::IpConfig {
             pool_v4: config.ip_pool.clone(),
             pool_v6: config.ip6_pool.clone(),
             mtu: config.ip_mtu,
             tun_name: config.ip_tun_name.clone(),
+            advertised_routes,
         })?)
     } else {
         None

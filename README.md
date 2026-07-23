@@ -119,8 +119,22 @@ Server verification defaults to the system/Mozilla CA bundle, so a public ACME (
 | `--ip6-pool` | | Enable CONNECT-IP with this IPv6 pool (CIDR) | off |
 | `--ip-mtu` | | MTU of the CONNECT-IP TUN device | `1280` |
 | `--ip-tun-name` | | Name for the CONNECT-IP TUN device | auto |
+| `--ip-routes-file` | | File of routes to advertise (one CIDR per line) — split tunnel | full tunnel |
 
 CONNECT-UDP is always served. CONNECT-IP is enabled only when `--ip-pool` and/or `--ip6-pool` is given; without a pool, `connect-ip` requests are rejected.
+
+### Split tunnel (`--ip-routes-file`)
+
+By default the server advertises a full tunnel (`0.0.0.0/0` and/or `::/0`). To route only specific prefixes through the tunnel, pass `--ip-routes-file` with one CIDR per line (`#` comments and blank lines ignored, IPv4/IPv6 mixed):
+
+```
+# only these go through the tunnel
+10.8.0.0/16
+172.16.0.0/12
+2001:db8:abcd::/48
+```
+
+The server sends these as the RFC 9484 ROUTE_ADVERTISEMENT (each advertisement is the complete set, per §4.7.3). The client installs exactly these prefixes as direct routes via the TUN and leaves the host's default route untouched — so a split tunnel needs no `--redirect-gateway`. The file is read once at startup; a route with no matching assigned address family is skipped.
 
 ## Deployment
 
