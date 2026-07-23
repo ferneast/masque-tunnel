@@ -33,6 +33,10 @@ pub struct MasqueCallbacks {
     pub on_routes: extern "C" fn(ctx: *mut c_void, routes_json: *const c_char),
     /// `state`: 0 = connecting, 1 = established, 2 = error. `detail` may be null.
     pub on_state: extern "C" fn(ctx: *mut c_void, state: i32, detail: *const c_char),
+    /// JSON array of DNS resolver addresses: `["8.8.8.8","2001:4860:4860::8888"]`
+    /// (DNS_ASSIGN, draft-ietf-masque-connect-ip-dns). The host programs
+    /// `NEDNSSettings` from these. Called only when the proxy advertises DNS.
+    pub on_dns: extern "C" fn(ctx: *mut c_void, dns_json: *const c_char),
 }
 
 // The host guarantees the pointers stay valid for the tunnel's lifetime.
@@ -54,6 +58,16 @@ impl ClientEvents for HostEvents {
             (self.cb.on_routes)(self.cb.ctx, json.as_ptr());
         }
     }
+    fn dns_assigned(&self, servers: &[IpAddr]) {
+        if let Ok(json) = CString::new(dns_json(servers)) {
+            (self.cb.on_dns)(self.cb.ctx, json.as_ptr());
+        }
+    }
+}
+
+fn dns_json(servers: &[IpAddr]) -> String {
+    let items: Vec<String> = servers.iter().map(|s| format!("\"{s}\"")).collect();
+    format!("[{}]", items.join(","))
 }
 
 fn addrs_json(addrs: &[(IpAddr, u8)]) -> String {
