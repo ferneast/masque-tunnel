@@ -27,6 +27,9 @@ pub struct ServerConfig {
     /// Optional file of routes to advertise to CONNECT-IP clients (one CIDR
     /// per line). None/absent advertises a full tunnel.
     pub ip_routes_file: Option<String>,
+    /// DNS resolver(s) to advertise to CONNECT-IP clients via a DNS_ASSIGN
+    /// capsule (draft-ietf-masque-connect-ip-dns). Empty = no DNS_ASSIGN.
+    pub dns_assign: Vec<std::net::IpAddr>,
 }
 
 /// Run the MASQUE CONNECT-UDP proxy server.
@@ -74,6 +77,7 @@ pub async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error +
             mtu: config.ip_mtu,
             tun_name: config.ip_tun_name.clone(),
             advertised_routes,
+            advertised_dns: config.dns_assign.clone(),
         })?)
     } else {
         None

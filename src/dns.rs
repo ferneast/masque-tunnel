@@ -83,6 +83,24 @@ impl DnsGuard {
         Ok(())
     }
 
+    /// Adopt server-pushed resolvers from a DNS_ASSIGN capsule
+    /// (draft-ietf-masque-connect-ip-dns) and apply them. An explicit `--dns`
+    /// wins: if the guard was constructed with servers, the pushed set is
+    /// ignored. Returns whether the pushed set was adopted.
+    pub fn adopt_pushed(
+        &mut self,
+        servers: Vec<IpAddr>,
+        routes: &crate::route::RouteSet,
+    ) -> io::Result<bool> {
+        // Already have servers (explicit --dns, or a prior DNS_ASSIGN) — keep them.
+        if !self.servers.is_empty() || servers.is_empty() {
+            return Ok(false);
+        }
+        self.servers = servers;
+        self.ensure_applied(routes)?;
+        Ok(true)
+    }
+
     /// Restore the original DNS configuration (also runs on Drop).
     pub fn revert(&mut self) {
         if !self.applied {

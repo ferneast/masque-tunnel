@@ -54,6 +54,10 @@ pub trait ClientEvents: Send + Sync {
     fn addresses_assigned(&self, addrs: &[(IpAddr, u8)]);
     /// The advertised route set (RFC 9484 ROUTE_ADVERTISEMENT).
     fn routes_advertised(&self, ranges: &[crate::capsule::IpAddressRange]);
+    /// Server-assigned DNS resolvers (draft-ietf-masque-connect-ip-dns).
+    /// Default: ignore — a host that does not program DNS from capsules (e.g.
+    /// one relying on the platform default) can leave this unimplemented.
+    fn dns_assigned(&self, _servers: &[IpAddr]) {}
 }
 
 /// The active TUN device plus the assignment it was configured with.
@@ -520,6 +524,29 @@ fn handle_capsule(
             if dns.is_enabled() {
                 if let Err(e) = dns.ensure_applied(routes) {
                     log::error!("[client] failed to set DNS: {e}");
+                }
+            }
+        }
+        CAPSULE_DNS_ASSIGN => {
+            let Some(servers) = parse_dns_assign(&capsule.payload) else {
+                log::warn!("[client] malformed DNS_ASSIGN");
+                return Ok(());
+            };
+            log::info!("[client] DNS_ASSIGN received: {servers:?}");
+            if servers.is_empty() {
+                return Ok(());
+            }
+            // iOS/tvOS: the host programs NEDNSSettings. On desktop, adopt the
+            // pushed resolvers unless the operator set --dns explicitly.
+            if let Some(events) = &config.events {
+                events.dns_assigned(&servers);
+            } else {
+                match dns.adopt_pushed(servers, routes) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        log::info!("[client] DNS_ASSIGN ignored (--dns override in effect)")
+                    }
+                    Err(e) => log::error!("[client] failed to apply DNS_ASSIGN: {e}"),
                 }
             }
         }

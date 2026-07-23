@@ -16,6 +16,9 @@ pub const CAPSULE_ADDRESS_ASSIGN: u64 = 0x01;
 pub const CAPSULE_ADDRESS_REQUEST: u64 = 0x02;
 /// ROUTE_ADVERTISEMENT capsule type (RFC 9484 §4.7.3).
 pub const CAPSULE_ROUTE_ADVERTISEMENT: u64 = 0x03;
+/// DNS_ASSIGN capsule type (draft-ietf-masque-connect-ip-dns). Provisional
+/// codepoint pending IANA assignment; changes when the draft becomes an RFC.
+pub const CAPSULE_DNS_ASSIGN: u64 = 0x1ACE_79EC;
 
 /// Upper bound on a single capsule's declared length. A hostile peer could
 /// otherwise make us buffer indefinitely waiting for the capsule to complete.
@@ -249,6 +252,98 @@ pub fn parse_route_advertisement(mut payload: &[u8]) -> Option<Vec<IpAddressRang
     Some(out)
 }
 
+// ---------------------------------------------------------------------------
+// DNS_ASSIGN (draft-ietf-masque-connect-ip-dns). Minimal profile: plain Do53
+// resolvers at IP addresses — no encrypted-DNS authentication domain, no SVCB
+// service parameters, no internal/search domains.
+//
+// DNS Configuration {
+//   Nameserver Count (i), Nameserver (..) ...,
+//   Internal Domain Count (i)=0, Search Domain Count (i)=0,
+// }
+// Nameserver {
+//   Service Priority (16), IPv4 Address Count (i), IPv4 Address (32) ...,
+//   IPv6 Address Count (i), IPv6 Address (128) ...,
+//   Authentication Domain Name (Domain), Service Parameters Length (i)=0,
+// }
+// Domain { Domain Length (i), Domain Name (..) }
+// ---------------------------------------------------------------------------
+
+/// Encode a minimal DNS_ASSIGN capsule: one Nameserver entry per resolver
+/// address (Service Priority 1, empty auth domain, no SvcParams => plain Do53),
+/// and no internal/search domains.
+pub fn encode_dns_assign(servers: &[IpAddr]) -> Bytes {
+    let mut cfg = BytesMut::new();
+    put_varint(&mut cfg, servers.len() as u64); // Nameserver Count
+    for s in servers {
+        cfg.put_u16(1); // Service Priority (SVCB); 1 = a normal entry
+        match s {
+            IpAddr::V4(a) => {
+                put_varint(&mut cfg, 1);
+                cfg.put_slice(&a.octets());
+                put_varint(&mut cfg, 0);
+            }
+            IpAddr::V6(a) => {
+                put_varint(&mut cfg, 0);
+                put_varint(&mut cfg, 1);
+                cfg.put_slice(&a.octets());
+            }
+        }
+        put_varint(&mut cfg, 0); // Authentication Domain Name length (none)
+        put_varint(&mut cfg, 0); // Service Parameters Length (plain Do53)
+    }
+    put_varint(&mut cfg, 0); // Internal Domain Count
+    put_varint(&mut cfg, 0); // Search Domain Count
+    encode_capsule(CAPSULE_DNS_ASSIGN, &cfg)
+}
+
+/// Parse a DNS_ASSIGN capsule payload, returning the resolver IP addresses
+/// across all Nameserver entries. Authentication domains, SvcParams, and
+/// internal/search domains are parsed past but ignored (minimal profile).
+pub fn parse_dns_assign(payload: &[u8]) -> Option<Vec<IpAddr>> {
+    let mut buf = payload;
+    let (ns_count, n) = decode_varint(buf)?;
+    buf = &buf[n..];
+    let mut out = Vec::new();
+    for _ in 0..ns_count {
+        // Service Priority (16 bits) — unused in the minimal profile.
+        if buf.len() < 2 {
+            return None;
+        }
+        buf = &buf[2..];
+        let (v4c, n) = decode_varint(buf)?;
+        buf = &buf[n..];
+        for _ in 0..v4c {
+            let o: [u8; 4] = buf.get(..4)?.try_into().ok()?;
+            out.push(IpAddr::V4(Ipv4Addr::from(o)));
+            buf = &buf[4..];
+        }
+        let (v6c, n) = decode_varint(buf)?;
+        buf = &buf[n..];
+        for _ in 0..v6c {
+            let o: [u8; 16] = buf.get(..16)?.try_into().ok()?;
+            out.push(IpAddr::V6(Ipv6Addr::from(o)));
+            buf = &buf[16..];
+        }
+        // Authentication Domain Name (Domain): length + bytes, skipped.
+        let (dlen, n) = decode_varint(buf)?;
+        buf = buf.get(n + dlen as usize..)?;
+        // Service Parameters: length + bytes, skipped.
+        let (splen, n) = decode_varint(buf)?;
+        buf = buf.get(n + splen as usize..)?;
+    }
+    // Internal + Search domains: counts + Domain entries, all skipped.
+    for _ in 0..2 {
+        let (count, n) = decode_varint(buf)?;
+        buf = &buf[n..];
+        for _ in 0..count {
+            let (dlen, n) = decode_varint(buf)?;
+            buf = buf.get(n + dlen as usize..)?;
+        }
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -261,6 +356,27 @@ mod tests {
             out.push(c);
         }
         out
+    }
+
+    #[test]
+    fn dns_assign_roundtrip() {
+        let servers: Vec<IpAddr> = vec![
+            "8.8.8.8".parse().unwrap(),
+            "2001:4860:4860::8888".parse().unwrap(),
+            "1.1.1.1".parse().unwrap(),
+        ];
+        let wire = encode_dns_assign(&servers);
+        let capsules = parse_all(&wire);
+        assert_eq!(capsules.len(), 1);
+        assert_eq!(capsules[0].capsule_type, CAPSULE_DNS_ASSIGN);
+        assert_eq!(parse_dns_assign(&capsules[0].payload).unwrap(), servers);
+    }
+
+    #[test]
+    fn dns_assign_empty_is_parseable() {
+        let wire = encode_dns_assign(&[]);
+        let capsules = parse_all(&wire);
+        assert_eq!(parse_dns_assign(&capsules[0].payload).unwrap(), Vec::<IpAddr>::new());
     }
 
     #[test]

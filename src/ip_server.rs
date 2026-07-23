@@ -42,6 +42,9 @@ pub struct IpConfig {
     /// Empty means advertise a full tunnel (0.0.0.0/0 and/or ::/0 for each
     /// assigned family). Loaded once at startup (see `parse_routes_file`).
     pub advertised_routes: Vec<(IpAddr, u8)>,
+    /// DNS resolver addresses to advertise via a DNS_ASSIGN capsule
+    /// (draft-ietf-masque-connect-ip-dns). Empty means no DNS_ASSIGN is sent.
+    pub advertised_dns: Vec<IpAddr>,
 }
 
 /// Allocates client host addresses from a v4 or v6 pool, skipping the
@@ -129,6 +132,8 @@ pub struct IpTunState {
     routes: RwLock<HashMap<IpAddr, DownstreamFlow>>,
     /// Routes advertised via ROUTE_ADVERTISEMENT (CIDRs). Empty = full tunnel.
     advertised_routes: Vec<(IpAddr, u8)>,
+    /// DNS resolvers advertised via DNS_ASSIGN. Empty = no DNS_ASSIGN sent.
+    advertised_dns: Vec<IpAddr>,
 }
 
 impl IpTunState {
@@ -398,11 +403,18 @@ pub fn init(config: &IpConfig) -> Result<Arc<IpTunState>, Box<dyn std::error::Er
         pool_v6: v6.map(|(net, prefix)| Mutex::new(AddressPool::new(net, prefix))),
         routes: RwLock::new(HashMap::new()),
         advertised_routes: config.advertised_routes.clone(),
+        advertised_dns: config.advertised_dns.clone(),
     });
     if !state.advertised_routes.is_empty() {
         log::info!(
             "[server] CONNECT-IP advertising {} configured route(s) (split tunnel)",
             state.advertised_routes.len()
+        );
+    }
+    if !state.advertised_dns.is_empty() {
+        log::info!(
+            "[server] CONNECT-IP advertising DNS resolver(s): {:?}",
+            state.advertised_dns
         );
     }
 
@@ -597,6 +609,15 @@ pub async fn handle_ip_request(
         log::error!("[server] Failed to send CONNECT-IP capsules");
         free_all(state);
         return None;
+    }
+    // Optionally advertise DNS resolvers (draft-ietf-masque-connect-ip-dns).
+    if !state.advertised_dns.is_empty() {
+        let dns_caps = encode_dns_assign(&state.advertised_dns);
+        if stream.send_data(dns_caps).await.is_err() {
+            log::error!("[server] Failed to send DNS_ASSIGN capsule");
+            free_all(state);
+            return None;
+        }
     }
 
     // h3's StreamId::index() is the stream's ordinal (raw QUIC stream ID / 4

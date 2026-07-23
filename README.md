@@ -120,8 +120,13 @@ Server verification defaults to the system/Mozilla CA bundle, so a public ACME (
 | `--ip-mtu` | | MTU of the CONNECT-IP TUN device | `1280` |
 | `--ip-tun-name` | | Name for the CONNECT-IP TUN device | auto |
 | `--ip-routes-file` | | File of routes to advertise (one CIDR per line) — split tunnel | full tunnel |
+| `--dns-assign` | | DNS resolver(s) to advertise to clients (repeatable) | none |
 
 CONNECT-UDP is always served. CONNECT-IP is enabled only when `--ip-pool` and/or `--ip6-pool` is given; without a pool, `connect-ip` requests are rejected.
+
+### DNS assignment (`--dns-assign`)
+
+RFC 9484 assigns addresses and routes but no resolver, so a CONNECT-IP client otherwise needs `--dns` to know what DNS to use. `--dns-assign <addr>` (repeatable, IPv4/IPv6) makes the server advertise resolvers in a **DNS_ASSIGN capsule** ([draft-ietf-masque-connect-ip-dns](https://datatracker.ietf.org/doc/draft-ietf-masque-connect-ip-dns/)); a client that wasn't given its own `--dns` adopts them automatically. This is a minimal profile (plain Do53 addresses — no encrypted-DNS/SVCB or search domains yet) and uses the draft's **provisional** capsule codepoint, which will change when the draft becomes an RFC.
 
 ### Split tunnel (`--ip-routes-file`)
 

@@ -150,6 +150,12 @@ enum Commands {
         /// advertise a full tunnel (0.0.0.0/0 and/or ::/0).
         #[arg(long)]
         ip_routes_file: Option<String>,
+
+        /// DNS resolver(s) to advertise to CONNECT-IP clients via a DNS_ASSIGN
+        /// capsule (draft-ietf-masque-connect-ip-dns), repeatable. Clients
+        /// without their own --dns adopt these automatically.
+        #[arg(long)]
+        dns_assign: Vec<std::net::IpAddr>,
     },
 }
 
@@ -223,6 +229,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             ip_mtu,
             ip_tun_name,
             ip_routes_file,
+            dns_assign,
         } => {
             server::run(server::ServerConfig {
                 listen,
@@ -234,6 +241,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 ip_mtu,
                 ip_tun_name,
                 ip_routes_file,
+                dns_assign,
             })
             .await
         }
