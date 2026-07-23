@@ -44,6 +44,16 @@ pub struct IpClientConfig {
     /// do itself (iOS/tvOS: `NEIPv4Settings` / routes / DNS). `None` on desktop,
     /// where the client configures the TUN, routes, and DNS directly.
     pub events: Option<std::sync::Arc<dyn ClientEvents>>,
+    /// Cumulative tunneled-byte counters the host may poll (FFI statistics).
+    pub stats: Option<std::sync::Arc<TunnelStats>>,
+}
+
+/// Cumulative tunneled traffic since start: `tx` counts IP bytes sent to the
+/// proxy, `rx` counts IP bytes delivered to the TUN. Survives reconnects.
+#[derive(Default)]
+pub struct TunnelStats {
+    pub tx: std::sync::atomic::AtomicU64,
+    pub rx: std::sync::atomic::AtomicU64,
 }
 
 /// Host-side configuration callbacks. On iOS/tvOS the `NEPacketTunnelProvider`
@@ -395,7 +405,11 @@ async fn run_tunnel(
                 if let Some((_, 0, payload)) = decode_datagram_ctx(&buf) {
                     if let Some(b) = tun.as_ref() {
                         // try_send: drop instead of blocking if the TUN is full.
-                        let _ = b.dev.try_send(payload);
+                        if b.dev.try_send(payload).is_ok() {
+                            if let Some(s) = config.stats.as_ref() {
+                                s.rx.fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
                     }
                 }
             }
@@ -425,7 +439,11 @@ async fn run_tunnel(
                     continue;
                 }
                 match dgram_conn.send_datagram(encode_datagram(quic_stream_id, &pkt_buf[..n])) {
-                    Ok(()) => {}
+                    Ok(()) => {
+                        if let Some(s) = config.stats.as_ref() {
+                            s.tx.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
                     Err(quinn::SendDatagramError::TooLarge) => {
                         log::trace!("[client] drop oversized datagram: {n} bytes")
                     }

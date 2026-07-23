@@ -14,12 +14,13 @@
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::net::IpAddr;
 use std::os::fd::RawFd;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::oneshot;
 
 use crate::capsule::IpAddressRange;
-use crate::ip_client::{self, ClientEvents, IpClientConfig};
+use crate::ip_client::{self, ClientEvents, IpClientConfig, TunnelStats};
 
 /// Host callbacks. Function pointers and `ctx` must stay valid until
 /// `masque_client_ip_stop` returns.
@@ -29,7 +30,9 @@ pub struct MasqueCallbacks {
     pub ctx: *mut c_void,
     /// JSON array: `[{"addr":"10.99.0.2","prefix":32}, …]`.
     pub on_addresses: extern "C" fn(ctx: *mut c_void, addrs_json: *const c_char),
-    /// JSON array: `[{"start":"0.0.0.0","end":"255.255.255.255","proto":0}, …]`.
+    /// JSON array of CIDRs expanded from the advertised ranges:
+    /// `[{"addr":"0.0.0.0","prefix":0,"proto":0}, …]` (`proto` 0 = all,
+    /// otherwise an IANA Internet Protocol Number).
     pub on_routes: extern "C" fn(ctx: *mut c_void, routes_json: *const c_char),
     /// `state`: 0 = connecting, 1 = established, 2 = error. `detail` may be null.
     pub on_state: extern "C" fn(ctx: *mut c_void, state: i32, detail: *const c_char),
@@ -42,6 +45,55 @@ pub struct MasqueCallbacks {
 // The host guarantees the pointers stay valid for the tunnel's lifetime.
 unsafe impl Send for MasqueCallbacks {}
 unsafe impl Sync for MasqueCallbacks {}
+
+/// Log sink: `level` 0 = error, 1 = warn, 2 = info, 3 = debug/trace.
+pub type MasqueLogCallback = extern "C" fn(level: i32, message: *const c_char);
+
+// Stored as a usize so the hot log path is a single atomic load; 0 = unset.
+static LOG_CB: AtomicUsize = AtomicUsize::new(0);
+
+struct FfiLogger;
+
+impl log::Log for FfiLogger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() <= log::Level::Debug
+    }
+    fn log(&self, record: &log::Record) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+        let cb = LOG_CB.load(Ordering::Acquire);
+        if cb == 0 {
+            return;
+        }
+        let cb: MasqueLogCallback = unsafe { std::mem::transmute(cb) };
+        let level = match record.level() {
+            log::Level::Error => 0,
+            log::Level::Warn => 1,
+            log::Level::Info => 2,
+            _ => 3,
+        };
+        if let Ok(msg) = CString::new(format!("{}", record.args())) {
+            cb(level, msg.as_ptr());
+        }
+    }
+    fn flush(&self) {}
+}
+
+static LOGGER: FfiLogger = FfiLogger;
+
+/// Route Rust `log` output to `callback`. Call once, before
+/// `masque_client_ip_start`; the callback must stay valid for the process
+/// lifetime and be callable from any thread.
+#[no_mangle]
+pub extern "C" fn masque_set_log_callback(callback: MasqueLogCallback) {
+    LOG_CB.store(callback as usize, Ordering::Release);
+    // Ignore the error on repeat calls: the logger is already installed and
+    // keeps reading the (updated) callback from LOG_CB.
+    if log::set_logger(&LOGGER).is_ok() {
+        log::set_max_level(log::LevelFilter::Debug);
+    }
+}
 
 struct HostEvents {
     cb: MasqueCallbacks,
@@ -81,20 +133,24 @@ fn addrs_json(addrs: &[(IpAddr, u8)]) -> String {
 fn routes_json(ranges: &[IpAddressRange]) -> String {
     let items: Vec<String> = ranges
         .iter()
-        .map(|r| {
-            format!(
-                "{{\"start\":\"{}\",\"end\":\"{}\",\"proto\":{}}}",
-                r.start, r.end, r.ip_proto
-            )
+        .flat_map(|r| {
+            let proto = r.ip_proto;
+            crate::route::range_to_cidrs(r.start, r.end)
+                .into_iter()
+                .map(move |(addr, prefix)| {
+                    format!("{{\"addr\":\"{addr}\",\"prefix\":{prefix},\"proto\":{proto}}}")
+                })
         })
         .collect();
     format!("[{}]", items.join(","))
 }
 
-/// Opaque handle owning the worker thread and its shutdown channel.
+/// Opaque handle owning the worker thread, its shutdown channel, and the
+/// traffic counters.
 pub struct MasqueHandle {
     shutdown: Option<oneshot::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
+    stats: Arc<TunnelStats>,
 }
 
 unsafe fn cstr(p: *const c_char) -> Option<String> {
@@ -105,16 +161,20 @@ unsafe fn cstr(p: *const c_char) -> Option<String> {
 }
 
 /// Start the CONNECT-IP client against `proxy_url`, forwarding over `tun_fd`
-/// (a dup of the provider's utun fd). `auth_token` may be null. Returns an
-/// opaque handle, or null on invalid input.
+/// (a dup of the provider's utun fd). `auth_token` and `sni` may be null;
+/// `mtu` 0 selects the default (1280). Returns an opaque handle, or null on
+/// invalid input.
 ///
 /// # Safety
-/// `proxy_url` must be a valid NUL-terminated UTF-8 string; `auth_token` the
-/// same or null. `callbacks` pointers must remain valid until stop.
+/// `proxy_url` must be a valid NUL-terminated UTF-8 string; `auth_token` and
+/// `sni` the same or null. `callbacks` pointers must remain valid until stop.
 #[no_mangle]
 pub unsafe extern "C" fn masque_client_ip_start(
     proxy_url: *const c_char,
     auth_token: *const c_char,
+    sni: *const c_char,
+    insecure: bool,
+    mtu: u16,
     tun_fd: RawFd,
     callbacks: MasqueCallbacks,
 ) -> *mut MasqueHandle {
@@ -122,19 +182,22 @@ pub unsafe extern "C" fn masque_client_ip_start(
         return std::ptr::null_mut();
     };
     let auth_token = cstr(auth_token);
+    let sni = cstr(sni);
+    let stats = Arc::new(TunnelStats::default());
 
     let config = IpClientConfig {
         proxy_url,
-        sni: None,
+        sni,
         auth_token,
-        insecure: false,
+        insecure,
         ca: None,
-        mtu: 1280,
+        mtu: if mtu == 0 { 1280 } else { mtu },
         tun_name: None,
         redirect_gateway: false,
         dns: Vec::new(),
         tun_fd: Some(tun_fd),
         events: Some(Arc::new(HostEvents { cb: callbacks })),
+        stats: Some(stats.clone()),
     };
 
     let (tx, rx) = oneshot::channel::<()>();
@@ -167,7 +230,32 @@ pub unsafe extern "C" fn masque_client_ip_start(
     Box::into_raw(Box::new(MasqueHandle {
         shutdown: Some(tx),
         thread: Some(thread),
+        stats,
     }))
+}
+
+/// Read the cumulative tunneled byte counters (survive reconnects). Either
+/// out-pointer may be null.
+///
+/// # Safety
+/// `handle` must be a live pointer returned by `masque_client_ip_start` (not
+/// yet stopped); `tx_bytes` / `rx_bytes` must be valid or null.
+#[no_mangle]
+pub unsafe extern "C" fn masque_client_ip_stats(
+    handle: *const MasqueHandle,
+    tx_bytes: *mut u64,
+    rx_bytes: *mut u64,
+) {
+    if handle.is_null() {
+        return;
+    }
+    let h = &*handle;
+    if !tx_bytes.is_null() {
+        *tx_bytes = h.stats.tx.load(Ordering::Relaxed);
+    }
+    if !rx_bytes.is_null() {
+        *rx_bytes = h.stats.rx.load(Ordering::Relaxed);
+    }
 }
 
 /// Stop the client and free the handle. Safe to call once per handle.

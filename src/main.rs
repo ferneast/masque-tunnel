@@ -216,6 +216,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 dns,
                 tun_fd: None,
                 events: None,
+                stats: None,
             })
             .await
         }
