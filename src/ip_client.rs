@@ -314,8 +314,10 @@ async fn run_tunnel(
         let _ = driver.wait_idle().await;
     });
 
-    // Full-tunnel CONNECT-IP request: target and ipproto are both `*`.
-    let path = format!("{CONNECT_IP_PATH}/*/*/");
+    // Full-tunnel CONNECT-IP request: target and ipproto are both the wildcard,
+    // which RFC 9484 Errata ID 8444 requires be percent-encoded as `%2A` (not a
+    // literal `*`) in the URI template expansion.
+    let path = format!("{CONNECT_IP_PATH}/%2A/%2A/");
     let uri: http::Uri = format!("https://{proxy_host}{path}").parse()?;
     let protocol: h3::ext::Protocol = "connect-ip".parse().map_err(|_| "invalid protocol")?;
     let mut req_builder = http::Request::builder()

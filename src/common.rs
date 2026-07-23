@@ -339,13 +339,20 @@ mod tests {
 
     #[test]
     fn parses_connect_ip_wildcards() {
+        // RFC 9484 Errata ID 8444: the wildcard MUST arrive percent-encoded as
+        // `%2A`; the server decodes it back to `*`.
+        assert_eq!(
+            parse_connect_ip_path("/.well-known/masque/ip/%2A/%2A/"),
+            Some(("*".into(), "*".into()))
+        );
+        // Tolerate a literal `*` too (pre-errata clients / lenient encoders).
         assert_eq!(
             parse_connect_ip_path("/.well-known/masque/ip/*/*/"),
             Some(("*".into(), "*".into()))
         );
         // Trailing slash is optional in the wild.
         assert_eq!(
-            parse_connect_ip_path("/.well-known/masque/ip/*/*"),
+            parse_connect_ip_path("/.well-known/masque/ip/%2A/%2A"),
             Some(("*".into(), "*".into()))
         );
     }
