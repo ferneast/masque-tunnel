@@ -46,6 +46,10 @@ pub struct IpClientConfig {
     pub events: Option<std::sync::Arc<dyn ClientEvents>>,
     /// Cumulative tunneled-byte counters the host may poll (FFI statistics).
     pub stats: Option<std::sync::Arc<TunnelStats>>,
+    /// Host signal to drop the current connection and reconnect immediately
+    /// (e.g. the iOS provider detected a network interface change), bypassing
+    /// the QUIC idle-timeout wait. `None` on desktop.
+    pub reconnect: Option<std::sync::Arc<tokio::sync::Notify>>,
 }
 
 /// Cumulative tunneled traffic since start: `tx` counts IP bytes sent to the
@@ -76,6 +80,15 @@ struct TunBinding {
     addrs: Vec<(IpAddr, u8)>,
 }
 
+/// Await the host's immediate-reconnect signal, or pend forever when none is
+/// wired (desktop CLI), so the `select!` arm simply never fires there.
+async fn wait_reconnect(notify: Option<&std::sync::Arc<tokio::sync::Notify>>) {
+    match notify {
+        Some(n) => n.notified().await,
+        None => std::future::pending().await,
+    }
+}
+
 /// Run the MASQUE CONNECT-IP client with automatic reconnection.
 pub async fn run(config: IpClientConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let url = url::Url::parse(&config.proxy_url)?;
@@ -98,14 +111,31 @@ pub async fn run(config: IpClientConfig) -> Result<(), Box<dyn std::error::Error
     let reconnect = async {
         let mut backoff_ms = 500u64;
         loop {
-            match run_tunnel(
-                &config, &client_config, &proxy_host, proxy_port, &sni, &mut tun, &mut routes,
-                &mut dns,
-            )
-            .await
-            {
-                Ok(()) => log::warn!("[client] tunnel ended, reconnecting in {backoff_ms}ms"),
-                Err(e) => log::warn!("[client] connection lost: {e}, reconnecting in {backoff_ms}ms"),
+            // Race the tunnel against an external immediate-reconnect signal.
+            // The host (iOS provider) fires it the instant the network path
+            // changes, so a Wi-Fi→cellular switch reconnects at once instead of
+            // waiting out the ~30s QUIC idle timeout on the dead socket.
+            let signaled = tokio::select! {
+                res = run_tunnel(
+                    &config, &client_config, &proxy_host, proxy_port, &sni, &mut tun, &mut routes,
+                    &mut dns,
+                ) => {
+                    match res {
+                        Ok(()) => log::warn!("[client] tunnel ended, reconnecting in {backoff_ms}ms"),
+                        Err(e) => log::warn!("[client] connection lost: {e}, reconnecting in {backoff_ms}ms"),
+                    }
+                    false
+                }
+                _ = wait_reconnect(config.reconnect.as_ref()) => {
+                    log::info!("[client] immediate reconnect requested (network change)");
+                    true
+                }
+            };
+            if signaled {
+                // New path is up — reconnect right away with no backoff, binding
+                // a fresh socket on the new default interface.
+                backoff_ms = 500;
+                continue;
             }
             tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
             backoff_ms = (backoff_ms * 2).min(30_000);

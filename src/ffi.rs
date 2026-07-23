@@ -153,12 +153,13 @@ fn routes_json(ranges: &[IpAddressRange]) -> String {
     format!("[{}]", items.join(","))
 }
 
-/// Opaque handle owning the worker thread, its shutdown channel, and the
-/// traffic counters.
+/// Opaque handle owning the worker thread, its shutdown channel, the traffic
+/// counters, and the immediate-reconnect signal.
 pub struct MasqueHandle {
     shutdown: Option<oneshot::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
     stats: Arc<TunnelStats>,
+    reconnect: Arc<tokio::sync::Notify>,
 }
 
 unsafe fn cstr(p: *const c_char) -> Option<String> {
@@ -192,6 +193,7 @@ pub unsafe extern "C" fn masque_client_ip_start(
     let auth_token = cstr(auth_token);
     let sni = cstr(sni);
     let stats = Arc::new(TunnelStats::default());
+    let reconnect = Arc::new(tokio::sync::Notify::new());
 
     let config = IpClientConfig {
         proxy_url,
@@ -206,6 +208,7 @@ pub unsafe extern "C" fn masque_client_ip_start(
         tun_fd: Some(tun_fd),
         events: Some(Arc::new(HostEvents { cb: callbacks })),
         stats: Some(stats.clone()),
+        reconnect: Some(reconnect.clone()),
     };
 
     let (tx, rx) = oneshot::channel::<()>();
@@ -239,7 +242,23 @@ pub unsafe extern "C" fn masque_client_ip_start(
         shutdown: Some(tx),
         thread: Some(thread),
         stats,
+        reconnect,
     }))
+}
+
+/// Signal the client to drop its current connection and reconnect immediately,
+/// bypassing the QUIC idle-timeout wait. Call when the host detects a network
+/// path change (e.g. Wi-Fi ↔ cellular). No-op if the client is not running.
+///
+/// # Safety
+/// `handle` must be a live pointer returned by `masque_client_ip_start` (not
+/// yet stopped).
+#[no_mangle]
+pub unsafe extern "C" fn masque_client_ip_reconnect(handle: *const MasqueHandle) {
+    if handle.is_null() {
+        return;
+    }
+    (*handle).reconnect.notify_one();
 }
 
 /// Read the cumulative tunneled byte counters (survive reconnects). Either

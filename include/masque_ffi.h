@@ -63,6 +63,12 @@ void masque_client_ip_stats(const MasqueHandle *handle,
                             uint64_t *tx_bytes,
                             uint64_t *rx_bytes);
 
+// Signals the client to drop its current connection and reconnect immediately,
+// bypassing the QUIC idle-timeout wait. Call when the host detects a network
+// path change (e.g. Wi-Fi <-> cellular). No-op if not running. handle must be
+// live (not yet stopped).
+void masque_client_ip_reconnect(const MasqueHandle *handle);
+
 // Stops the client, joins its worker thread, and frees the handle.
 // Call at most once per handle.
 void masque_client_ip_stop(MasqueHandle *handle);
