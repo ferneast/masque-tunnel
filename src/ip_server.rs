@@ -580,44 +580,20 @@ pub async fn handle_ip_request(
         }
     };
 
-    // 200 response, then the unprompted ADDRESS_ASSIGN (complete set) and a
-    // default route per family (RFC 9484 §4.7.1/§4.7.3) as capsule bodies.
+    // 200 response only. The addresses are reserved here (pool exhaustion is
+    // rejected with 503 before the 200), but announced from the capsule loop
+    // in response to the client's ADDRESS_REQUEST, followed by routes and DNS
+    // (RFC 9484 §4.7.1/§4.7.3).
     let resp = http::Response::builder()
         .status(200)
         .header("capsule-protocol", "?1")
+        .header("server", IDENT)
         .body(())
         .unwrap();
     if let Err(e) = stream.send_response(resp).await {
         log::error!("[server] Failed to send CONNECT-IP 200: {e}");
         free_all(state);
         return None;
-    }
-
-    let assign = encode_address_assign(
-        &assigned
-            .iter()
-            .map(|(ip, pfx)| AssignedAddress {
-                request_id: 0,
-                addr: *ip,
-                prefix_len: *pfx,
-            })
-            .collect::<Vec<_>>(),
-    );
-    let ranges = route_ranges(&state.advertised_routes, &assigned);
-    let route_caps = encode_route_advertisement(&ranges);
-    if stream.send_data(assign).await.is_err() || stream.send_data(route_caps).await.is_err() {
-        log::error!("[server] Failed to send CONNECT-IP capsules");
-        free_all(state);
-        return None;
-    }
-    // Optionally advertise DNS resolvers (draft-ietf-masque-connect-ip-dns).
-    if !state.advertised_dns.is_empty() {
-        let dns_caps = encode_dns_assign(&state.advertised_dns);
-        if stream.send_data(dns_caps).await.is_err() {
-            log::error!("[server] Failed to send DNS_ASSIGN capsule");
-            free_all(state);
-            return None;
-        }
     }
 
     // h3's StreamId::index() is the stream's ordinal (raw QUIC stream ID / 4
@@ -652,10 +628,11 @@ pub async fn handle_ip_request(
     };
     let (send_half, recv_half) = stream.split();
     let cleanup = cleanup_tx.clone();
-    let capsule_assigned = assigned_ips.clone();
+    let capsule_assigned = assigned.clone();
+    let capsule_state = state.clone();
     let handle = tokio::spawn(async move {
         let _guard = guard;
-        capsule_loop(recv_half, send_half, capsule_assigned).await;
+        capsule_loop(recv_half, send_half, capsule_assigned, capsule_state).await;
         let _ = cleanup.send(quic_stream_id).await;
     });
 
@@ -670,9 +647,17 @@ pub async fn handle_ip_request(
 }
 
 /// Capsule loop: reads capsules off the request-stream body and answers
-/// ADDRESS_REQUESTs. Ends on FIN/reset, which tears the session down.
-async fn capsule_loop(mut recv: H3RecvHalf, mut send: H3SendHalf, assigned: Vec<IpAddr>) {
+/// ADDRESS_REQUESTs; the first answered request also triggers the
+/// ROUTE_ADVERTISEMENT and DNS_ASSIGN capsules. Ends on FIN/reset, which
+/// tears the session down.
+async fn capsule_loop(
+    mut recv: H3RecvHalf,
+    mut send: H3SendHalf,
+    assigned: Vec<(IpAddr, u8)>,
+    state: Arc<IpTunState>,
+) {
     let mut parser = CapsuleParser::default();
+    let mut announced = false;
     loop {
         match recv.recv_data().await {
             Ok(Some(mut buf)) => {
@@ -684,7 +669,10 @@ async fn capsule_loop(mut recv: H3RecvHalf, mut send: H3SendHalf, assigned: Vec<
                 }
                 loop {
                     match parser.next_capsule() {
-                        Ok(Some(capsule)) => handle_capsule(&mut send, capsule, &assigned).await,
+                        Ok(Some(capsule)) => {
+                            handle_capsule(&mut send, capsule, &assigned, &state, &mut announced)
+                                .await
+                        }
                         Ok(None) => break,
                         Err(e) => {
                             log::warn!("[server] Malformed capsule from {assigned:?}: {e}");
@@ -702,7 +690,13 @@ async fn capsule_loop(mut recv: H3RecvHalf, mut send: H3SendHalf, assigned: Vec<
     }
 }
 
-async fn handle_capsule(send: &mut H3SendHalf, capsule: Capsule, assigned: &[IpAddr]) {
+async fn handle_capsule(
+    send: &mut H3SendHalf,
+    capsule: Capsule,
+    assigned: &[(IpAddr, u8)],
+    state: &Arc<IpTunState>,
+    announced: &mut bool,
+) {
     match capsule.capsule_type {
         CAPSULE_ADDRESS_REQUEST => {
             let Some(requests) = parse_address_request(&capsule.payload) else {
@@ -713,7 +707,7 @@ async fn handle_capsule(send: &mut H3SendHalf, capsule: Capsule, assigned: &[IpA
                 log::warn!("[server] Empty ADDRESS_REQUEST from {assigned:?}");
                 return;
             }
-            // Answer each request with the already-assigned address of the
+            // Answer each request with the already-reserved address of the
             // matching family for a no-preference (or exact-match) request,
             // and refuse anything else with the all-zero address + max prefix
             // length (RFC 9484 §4.7.1). ADDRESS_ASSIGN must carry the complete
@@ -724,7 +718,7 @@ async fn handle_capsule(send: &mut H3SendHalf, capsule: Capsule, assigned: &[IpA
             for r in &requests {
                 let want_v6 = r.addr.is_ipv6();
                 let no_pref = r.addr.is_unspecified();
-                let matched = assigned.iter().copied().find(|a| {
+                let matched = assigned.iter().map(|(a, _)| *a).find(|a| {
                     a.is_ipv6() == want_v6 && (no_pref || *a == r.addr) && !claimed.contains(a)
                 });
                 if let Some(a) = matched {
@@ -742,7 +736,7 @@ async fn handle_capsule(send: &mut H3SendHalf, capsule: Capsule, assigned: &[IpA
                     });
                 }
             }
-            for a in assigned {
+            for (a, _) in assigned {
                 if !claimed.contains(a) {
                     out.push(AssignedAddress {
                         request_id: 0,
@@ -751,7 +745,35 @@ async fn handle_capsule(send: &mut H3SendHalf, capsule: Capsule, assigned: &[IpA
                     });
                 }
             }
-            let _ = send.send_data(encode_address_assign(&out)).await;
+            if send.send_data(encode_address_assign(&out)).await.is_err() {
+                log::warn!("[server] Failed to send ADDRESS_ASSIGN to {assigned:?}");
+                return;
+            }
+            // Routes point into the address set just announced, so they must
+            // follow the first ADDRESS_ASSIGN (the client ignores routes that
+            // arrive before an address).
+            if !*announced {
+                *announced = true;
+                let ranges = route_ranges(&state.advertised_routes, assigned);
+                if send
+                    .send_data(encode_route_advertisement(&ranges))
+                    .await
+                    .is_err()
+                {
+                    log::warn!("[server] Failed to send ROUTE_ADVERTISEMENT to {assigned:?}");
+                    return;
+                }
+                // Optionally advertise DNS resolvers
+                // (draft-ietf-masque-connect-ip-dns).
+                if !state.advertised_dns.is_empty()
+                    && send
+                        .send_data(encode_dns_assign(&state.advertised_dns))
+                        .await
+                        .is_err()
+                {
+                    log::warn!("[server] Failed to send DNS_ASSIGN to {assigned:?}");
+                }
+            }
         }
         CAPSULE_ROUTE_ADVERTISEMENT => {
             // We never route traffic toward client networks (full-tunnel NAT

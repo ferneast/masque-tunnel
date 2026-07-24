@@ -296,9 +296,10 @@ apps ──▶ TUN ──▶ client ──QUIC/H3──▶ server ──▶ TUN 
 ```
 
 1. Client sends an extended CONNECT (`:protocol = connect-ip`) with path `/.well-known/masque/ip/*/*/`.
-2. Server replies `200` and, on the request stream, sends an unprompted `ADDRESS_ASSIGN` (a /32 and/or /128 from its pool) plus a `ROUTE_ADVERTISEMENT` for the default route (RFC 9484 capsules).
-3. Client brings up a TUN with the assigned address; IP packets travel as QUIC DATAGRAMs (context-id 0), while capsules travel on the request stream.
-4. The server writes upstream packets to a shared TUN (source-validated against the assigned address) and routes downstream packets by destination; the kernel handles forwarding, NAT, and the hop-count decrement.
+2. Server replies `200`; the client then sends an `ADDRESS_REQUEST` (one no-preference entry per family) on the request stream.
+3. Server answers with an `ADDRESS_ASSIGN` (a /32 and/or /128 from its pool, echoing the Request IDs) plus a `ROUTE_ADVERTISEMENT` for the default route (RFC 9484 capsules).
+4. Client brings up a TUN with the assigned address; IP packets travel as QUIC DATAGRAMs (context-id 0), while capsules travel on the request stream.
+5. The server writes upstream packets to a shared TUN (source-validated against the assigned address) and routes downstream packets by destination; the kernel handles forwarding, NAT, and the hop-count decrement.
 
 ## License
 

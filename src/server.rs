@@ -327,6 +327,7 @@ async fn handle_request(
     let resp = http::Response::builder()
         .status(200)
         .header("capsule-protocol", "?1")
+        .header("server", IDENT)
         .body(())
         .unwrap();
     if let Err(e) = stream.send_response(resp).await {

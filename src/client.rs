@@ -175,7 +175,8 @@ async fn run_tunnel_inner(
     let mut req_builder = http::Request::builder()
         .method("CONNECT")
         .uri(uri)
-        .header("capsule-protocol", "?1");
+        .header("capsule-protocol", "?1")
+        .header("user-agent", IDENT);
     if let Some(token) = auth_token {
         req_builder = req_builder.header("proxy-authorization", format!("Bearer {token}"));
     }
@@ -186,6 +187,9 @@ async fn run_tunnel_inner(
 
     if resp.status() != http::StatusCode::OK {
         return Err(format!("CONNECT-UDP rejected: status {}", resp.status()).into());
+    }
+    if let Some(server) = resp.headers().get("server").and_then(|v| v.to_str().ok()) {
+        log::info!("[client] proxy server: {server}");
     }
 
     // Use raw QUIC stream ID for DATAGRAM Quarter Stream ID encoding.

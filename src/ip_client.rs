@@ -9,7 +9,7 @@
 //! the RFC 9297 quarter-stream-id prefix and a context ID of 0.
 
 use std::collections::VecDeque;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -367,7 +367,8 @@ async fn run_tunnel(
     let mut req_builder = http::Request::builder()
         .method("CONNECT")
         .uri(uri)
-        .header("capsule-protocol", "?1");
+        .header("capsule-protocol", "?1")
+        .header("user-agent", IDENT);
     if let Some(token) = &config.auth_token {
         req_builder = req_builder.header("proxy-authorization", format!("Bearer {token}"));
     }
@@ -378,10 +379,33 @@ async fn run_tunnel(
     if resp.status() != http::StatusCode::OK {
         return Err(format!("CONNECT-IP rejected: status {}", resp.status()).into());
     }
+    if let Some(server) = resp.headers().get("server").and_then(|v| v.to_str().ok()) {
+        log::info!("[client] proxy server: {server}");
+    }
 
     // The raw QUIC stream ID feeds the DATAGRAM quarter-stream-id (id/4).
     let quic_stream_id = stream.id().index() * 4;
     log::info!("[client] CONNECT-IP established (stream_id={quic_stream_id})");
+
+    // Interactive assignment (RFC 9484 §4.7.2): request one address per family
+    // (all-zero address = no preference) instead of waiting for an unprompted
+    // ADDRESS_ASSIGN. The server answers with the complete assigned set,
+    // refusing a family it cannot serve with an all-zero entry.
+    stream
+        .send_data(encode_address_request(&[
+            RequestedAddress {
+                request_id: 1,
+                addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                prefix_len: 32,
+            },
+            RequestedAddress {
+                request_id: 2,
+                addr: IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+                prefix_len: 128,
+            },
+        ]))
+        .await?;
+    log::debug!("[client] sent ADDRESS_REQUEST (v4 + v6, no preference)");
 
     let mut parser = CapsuleParser::default();
     let mut pkt_buf = vec![0u8; config.mtu.max(1280) as usize + 64];
