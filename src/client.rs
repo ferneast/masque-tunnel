@@ -49,6 +49,10 @@ pub async fn run(config: ClientConfig) -> Result<(), Box<dyn std::error::Error +
             .try_into()
             .map_err(|e| format!("{e}"))?,
     ));
+    // Send PING frames well under max_idle_timeout so an idle tunnel (e.g. an
+    // inner WireGuard flow with no traffic) doesn't hit the 30s idle timeout and
+    // churn a reconnect every ~30s.
+    transport.keep_alive_interval(Some(Duration::from_secs(10)));
     transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
 
     let mut client_config = quinn::ClientConfig::new(Arc::new(

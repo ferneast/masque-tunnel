@@ -111,6 +111,10 @@ pub async fn run(config: IpClientConfig) -> Result<(), Box<dyn std::error::Error
     let reconnect = async {
         let mut backoff_ms = 500u64;
         loop {
+            // Set by run_tunnel once CONNECT-IP is established, so a drop after a
+            // healthy session restarts backoff from the floor instead of
+            // inheriting the growth from an earlier outage.
+            let mut established = false;
             // Race the tunnel against an external immediate-reconnect signal.
             // The host (iOS provider) fires it the instant the network path
             // changes, so a Wi-Fi→cellular switch reconnects at once instead of
@@ -118,8 +122,11 @@ pub async fn run(config: IpClientConfig) -> Result<(), Box<dyn std::error::Error
             let signaled = tokio::select! {
                 res = run_tunnel(
                     &config, &client_config, &proxy_host, proxy_port, &sni, &mut tun, &mut routes,
-                    &mut dns,
+                    &mut dns, &mut established,
                 ) => {
+                    if established {
+                        backoff_ms = 500;
+                    }
                     match res {
                         Ok(()) => log::warn!("[client] tunnel ended, reconnecting in {backoff_ms}ms"),
                         Err(e) => log::warn!("[client] connection lost: {e}, reconnecting in {backoff_ms}ms"),
@@ -208,12 +215,20 @@ fn build_client_config(
             .with_no_client_auth()
     };
     crypto.alpn_protocols = vec![b"h3".to_vec()];
+    // Allow 0-RTT on reconnect: the shared client config's rustls session store
+    // persists tickets across reconnects, so a resumed handshake sends the
+    // CONNECT-IP request as early data and reaches address assignment one RTT
+    // sooner. quinn transparently falls back to 1-RTT if the server rejects it.
+    crypto.enable_early_data = true;
 
     let mut transport = quinn::TransportConfig::default();
     transport.initial_mtu(1350);
     transport.datagram_receive_buffer_size(Some(8_000_000));
     transport.datagram_send_buffer_size(8_000_000);
     transport.max_idle_timeout(Some(Duration::from_secs(30).try_into()?));
+    // quinn PING frames keep an idle tunnel under max_idle_timeout, replacing the
+    // app-level keepalive datagram the forwarding loop used to send.
+    transport.keep_alive_interval(Some(Duration::from_secs(10)));
     transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
 
     let mut client_config = quinn::ClientConfig::new(Arc::new(
@@ -264,7 +279,26 @@ async fn establish_connection(
                         let ep = ep.clone();
                         let sni = sni.to_string();
                         running.push(async move {
-                            let conn = ep.connect(addr, &sni)?.await?;
+                            let connecting = ep.connect(addr, &sni)?;
+                            // Resume with 0-RTT when a cached ticket lets us;
+                            // otherwise complete the full handshake. Only the
+                            // replay-safe CONNECT-IP request rides as early data
+                            // — IP datagrams wait for the post-handshake address
+                            // assignment.
+                            let conn = match connecting.into_0rtt() {
+                                Ok((conn, accepted)) => {
+                                    log::info!("[client] resuming with 0-RTT to {addr}");
+                                    tokio::spawn(async move {
+                                        if accepted.await {
+                                            log::info!("[client] 0-RTT accepted by server");
+                                        } else {
+                                            log::info!("[client] 0-RTT rejected, fell back to 1-RTT");
+                                        }
+                                    });
+                                    conn
+                                }
+                                Err(connecting) => connecting.await?,
+                            };
                             Ok::<_, Box<dyn std::error::Error + Send + Sync>>((conn, addr))
                         });
                     }
@@ -305,7 +339,6 @@ enum Event {
     /// A downstream QUIC DATAGRAM, or `None` when the connection closes.
     Datagram(Option<Bytes>),
     Tun(std::io::Result<usize>),
-    Keepalive,
     AssignTimeout,
 }
 
@@ -319,6 +352,7 @@ async fn run_tunnel(
     tun: &mut Option<TunBinding>,
     routes: &mut crate::route::RouteSet,
     dns: &mut crate::dns::DnsGuard,
+    established: &mut bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addrs: Vec<SocketAddr> = tokio::net::lookup_host((proxy_host, proxy_port))
         .await?
@@ -386,6 +420,9 @@ async fn run_tunnel(
     // The raw QUIC stream ID feeds the DATAGRAM quarter-stream-id (id/4).
     let quic_stream_id = stream.id().index() * 4;
     log::info!("[client] CONNECT-IP established (stream_id={quic_stream_id})");
+    // The server accepted CONNECT-IP: this attempt genuinely connected, so the
+    // reconnect loop resets its backoff floor.
+    *established = true;
 
     // Interactive assignment (RFC 9484 §4.7.2): request one address per family
     // (all-zero address = no preference) instead of waiting for an unprompted
@@ -414,9 +451,6 @@ async fn run_tunnel(
     // (withdraw-all, RFC 9484 §4.7.1) is legal and must not trip the deadline.
     let mut ever_assigned = tun.is_some();
     let assign_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    // Keep an idle tunnel alive well under the 30s max_idle_timeout.
-    let mut keepalive = tokio::time::interval(Duration::from_secs(10));
-    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         let event = tokio::select! {
@@ -435,7 +469,6 @@ async fn run_tunnel(
                     None => std::future::pending().await,
                 }
             } => Event::Tun(r),
-            _ = keepalive.tick() => Event::Keepalive,
             _ = tokio::time::sleep_until(assign_deadline), if !ever_assigned => Event::AssignTimeout,
         };
 
@@ -503,12 +536,6 @@ async fn run_tunnel(
                     }
                     Err(e) => return Err(e.into()),
                 }
-            }
-            Event::Keepalive => {
-                // Empty ack-eliciting datagram keeps the QUIC connection under
-                // max_idle_timeout while the tunnel is idle. context != 0, so
-                // the proxy drops it instead of treating it as an IP packet.
-                let _ = dgram_conn.send_datagram(encode_datagram_ctx(quic_stream_id, 1, &[]));
             }
             Event::AssignTimeout => {
                 return Err("proxy did not assign an address within 10s".into())
