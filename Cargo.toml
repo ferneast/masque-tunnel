@@ -1,12 +1,14 @@
 [package]
 name = "masque-tunnel"
-version = "0.9.8"
+version = "0.13.0"
 edition = "2021"
-description = "MASQUE CONNECT-UDP tunnel (RFC 9298)"
+description = "MASQUE tunnel on quinn+h3: CONNECT-UDP (RFC 9298) and CONNECT-IP (RFC 9484)"
 
 [lib]
 name = "masque_tunnel"
 path = "src/lib.rs"
+# `lib` (rlib) for the bin + tests; `staticlib` for the iOS/tvOS xcframework.
+crate-type = ["lib", "staticlib"]
 
 [[bin]]
 name = "masque-tunnel"
@@ -19,11 +21,24 @@ h3-quinn = "0.0.10"
 http = "1"
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
 rustls-pemfile = "2"
-tokio = { version = "1", features = ["net", "sync", "time", "rt-multi-thread", "macros"] }
+# Default TLS trust: the Mozilla CA bundle, so the CONNECT-IP client (incl. iOS)
+# verifies public ACME certificates without platform-specific trust glue.
+webpki-roots = "0.26"
+tokio = { version = "1", features = ["net", "sync", "time", "rt-multi-thread", "macros", "signal"] }
+futures-util = "0.3"
 clap = { version = "4", features = ["derive"] }
 bytes = "1"
 url = "2"
 log = "0.4"
+# TUN device for the CONNECT-IP server and client.
+tun-rs = { version = "2.8.7", features = ["async_tokio"] }
+
+# h3 0.0.8's `:protocol` pseudo-header parser is a closed enum (webtransport,
+# connect-udp) and rejects any other value with H3_MESSAGE_ERROR before the
+# request reaches the handler. Vendor the crate with a one-line ConnectIp
+# addition so RFC 9484 extended CONNECTs parse. Applies to h3-quinn too.
+[patch.crates-io]
+h3 = { path = "vendor/h3" }
 
 [profile.release]
 lto = "fat"

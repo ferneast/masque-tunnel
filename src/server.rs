@@ -8,6 +8,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
 use crate::common::*;
+use crate::ip_server::{self, IpSession, IpTunState};
 
 /// Server configuration parsed from CLI arguments.
 pub struct ServerConfig {
@@ -15,6 +16,20 @@ pub struct ServerConfig {
     pub cert: String,
     pub key: String,
     pub auth_token: Option<String>,
+    /// When set, enables CONNECT-IP with this IPv4 pool (CIDR).
+    pub ip_pool: Option<String>,
+    /// When set, enables CONNECT-IP with this IPv6 pool (CIDR).
+    pub ip6_pool: Option<String>,
+    /// MTU of the CONNECT-IP TUN device.
+    pub ip_mtu: u16,
+    /// Optional name for the CONNECT-IP TUN device.
+    pub ip_tun_name: Option<String>,
+    /// Optional file of routes to advertise to CONNECT-IP clients (one CIDR
+    /// per line). None/absent advertises a full tunnel.
+    pub ip_routes_file: Option<String>,
+    /// DNS resolver(s) to advertise to CONNECT-IP clients via a DNS_ASSIGN
+    /// capsule (draft-ietf-masque-connect-ip-dns). Empty = no DNS_ASSIGN.
+    pub dns_assign: Vec<std::net::IpAddr>,
 }
 
 /// Run the MASQUE CONNECT-UDP proxy server.
@@ -50,9 +65,28 @@ pub async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error +
     let endpoint = quinn::Endpoint::server(server_config, listen_addr)?;
     log::info!("[server] MASQUE server listening on {listen_addr}");
 
+    // CONNECT-IP is opt-in: it needs a TUN device (root) and an address pool.
+    let ip_state = if config.ip_pool.is_some() || config.ip6_pool.is_some() {
+        let advertised_routes = match &config.ip_routes_file {
+            Some(path) => ip_server::parse_routes_file(path)?,
+            None => Vec::new(),
+        };
+        Some(ip_server::init(&ip_server::IpConfig {
+            pool_v4: config.ip_pool.clone(),
+            pool_v6: config.ip6_pool.clone(),
+            mtu: config.ip_mtu,
+            tun_name: config.ip_tun_name.clone(),
+            advertised_routes,
+            advertised_dns: config.dns_assign.clone(),
+        })?)
+    } else {
+        None
+    };
+
     let auth_token = config.auth_token;
     while let Some(incoming) = endpoint.accept().await {
         let auth_token = auth_token.clone();
+        let ip_state = ip_state.clone();
         tokio::spawn(async move {
             let conn = match incoming.accept() {
                 Ok(c) => match c.await {
@@ -68,7 +102,7 @@ pub async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error +
                 }
             };
             log::info!("[server] Connection from {}", conn.remote_address());
-            if let Err(e) = handle_connection(conn, auth_token).await {
+            if let Err(e) = handle_connection(conn, auth_token, ip_state).await {
                 log::error!("[server] Connection error: {e}");
             }
             log::info!("[server] Connection closed");
@@ -78,8 +112,15 @@ pub async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error +
     Ok(())
 }
 
-/// Per-session state: keeps the CONNECT-UDP stream alive and tracks the target socket.
-struct Session {
+/// Per-session state, keyed by the raw QUIC stream ID of its request. One
+/// QUIC connection can multiplex CONNECT-UDP and CONNECT-IP sessions.
+enum Session {
+    Udp(UdpSession),
+    Ip(IpSession),
+}
+
+/// CONNECT-UDP session: keeps the stream alive and tracks the target socket.
+struct UdpSession {
     target: Arc<UdpSocket>,
     /// Hold the CONNECT-UDP stream to prevent it from being dropped.
     /// RFC 9298 §3.2: the session lifetime is tied to the stream — dropping
@@ -92,7 +133,7 @@ struct Session {
     reader: tokio::task::AbortHandle,
 }
 
-impl Drop for Session {
+impl Drop for UdpSession {
     fn drop(&mut self) {
         self.reader.abort();
     }
@@ -101,6 +142,7 @@ impl Drop for Session {
 async fn handle_connection(
     quinn_conn: quinn::Connection,
     auth_token: Option<String>,
+    ip_state: Option<Arc<IpTunState>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Clone for datagram I/O — h3-quinn takes ownership of one clone for H3 stream processing
     let dgram_conn = quinn_conn.clone();
@@ -128,7 +170,7 @@ async fn handle_connection(
                             Ok((req, stream)) => {
                                 handle_request(
                                     req, stream, &mut sessions, &auth_token,
-                                    &dgram_conn, &cleanup_tx,
+                                    &dgram_conn, &cleanup_tx, &ip_state,
                                 ).await;
                             }
                             Err(e) => log::error!("[server] Request resolve error: {e}"),
@@ -141,14 +183,16 @@ async fn handle_connection(
                     }
                 }
             }
-            // Client -> target: decode DATAGRAM and forward
+            // Client -> tunnel: decode DATAGRAM and forward by session kind
             result = dgram_conn.read_datagram() => {
                 let data = result?;
-                if let Some((stream_id, payload)) = decode_datagram(&data) {
-                    if let Some(session) = sessions.get(&stream_id) {
-                        let _ = session.target.try_send(payload);
-                    } else {
-                        log::trace!("[server] No session for stream_id={stream_id}");
+                if let Some((stream_id, ctx, payload)) = decode_datagram_ctx(&data) {
+                    match sessions.get(&stream_id) {
+                        Some(Session::Udp(s)) => {
+                            let _ = s.target.try_send(payload);
+                        }
+                        Some(Session::Ip(s)) => s.forward_upstream(ctx, payload),
+                        None => log::trace!("[server] No session for stream_id={stream_id}"),
                     }
                 }
             }
@@ -176,18 +220,25 @@ async fn handle_request(
     auth_token: &Option<String>,
     dgram_conn: &quinn::Connection,
     cleanup_tx: &mpsc::Sender<u64>,
+    ip_state: &Option<Arc<IpTunState>>,
 ) {
-    let protocol = req.extensions().get::<Protocol>();
-    let is_connect_udp = req.method() == http::Method::CONNECT
-        && protocol.map(|p| p.as_str()) == Some("connect-udp");
+    let protocol = req
+        .extensions()
+        .get::<Protocol>()
+        .map(|p| p.as_str().to_string());
+    let is_connect = req.method() == http::Method::CONNECT;
+    let is_connect_udp = is_connect && protocol.as_deref() == Some("connect-udp");
+    // connect-ip requests are only supported when a pool was configured.
+    let is_connect_ip =
+        is_connect && protocol.as_deref() == Some("connect-ip") && ip_state.is_some();
 
-    if !is_connect_udp {
+    if !is_connect_udp && !is_connect_ip {
         let resp = http::Response::builder().status(405).body(()).unwrap();
         let _ = stream.send_response(resp).await;
         return;
     }
 
-    // Auth check
+    // Auth check (shared by both extended-CONNECT protocols)
     if let Some(expected) = auth_token {
         let expected_header = format!("Bearer {expected}");
         let auth_ok = req
@@ -202,6 +253,19 @@ async fn handle_request(
             return;
         }
     }
+
+    if is_connect_ip {
+        let path = req.uri().path().to_string();
+        let state = ip_state.as_ref().expect("checked above");
+        if let Some((stream_id, session)) =
+            ip_server::handle_ip_request(state, &path, stream, dgram_conn, cleanup_tx).await
+        {
+            sessions.insert(stream_id, Session::Ip(session));
+        }
+        return;
+    }
+
+    // --- CONNECT-UDP (RFC 9298) from here on ---
 
     // Parse target from URI path
     let path = req.uri().path();
@@ -263,6 +327,7 @@ async fn handle_request(
     let resp = http::Response::builder()
         .status(200)
         .header("capsule-protocol", "?1")
+        .header("server", IDENT)
         .body(())
         .unwrap();
     if let Err(e) = stream.send_response(resp).await {
@@ -319,11 +384,11 @@ async fn handle_request(
     // so it stays alive for the duration of the CONNECT-UDP session.
     sessions.insert(
         quic_stream_id,
-        Session {
+        Session::Udp(UdpSession {
             target,
             _stream: stream,
             reader: handle.abort_handle(),
-        },
+        }),
     );
 }
 
