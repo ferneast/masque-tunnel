@@ -63,6 +63,14 @@ void masque_client_ip_stats(const MasqueHandle *handle,
                             uint64_t *tx_bytes,
                             uint64_t *rx_bytes);
 
+// Hands the client a replacement TUN fd (a dup of the provider's current utun
+// fd; the client takes ownership). Call after a tunnel-settings apply rebuilt
+// the interface (macOS re-points the packet flow at a fresh utun, leaving the
+// fd passed to start on a dead interface). The client swaps its forwarding
+// device in place without dropping the QUIC connection. No-op for fd < 0.
+// handle must be live (not yet stopped).
+void masque_client_ip_update_tun_fd(const MasqueHandle *handle, int32_t tun_fd);
+
 // Signals the client to drop its current connection and reconnect immediately,
 // bypassing the QUIC idle-timeout wait. Call when the host detects a network
 // path change (e.g. Wi-Fi <-> cellular). No-op if not running. handle must be

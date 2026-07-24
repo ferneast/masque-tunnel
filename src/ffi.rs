@@ -20,7 +20,7 @@ use std::sync::Arc;
 use tokio::sync::oneshot;
 
 use crate::capsule::IpAddressRange;
-use crate::ip_client::{self, ClientEvents, IpClientConfig, TunnelStats};
+use crate::ip_client::{self, ClientEvents, IpClientConfig, TunFdSlot, TunnelStats};
 
 /// Host callbacks. Function pointers and `ctx` must stay valid until
 /// `masque_client_ip_stop` returns.
@@ -160,6 +160,7 @@ pub struct MasqueHandle {
     thread: Option<std::thread::JoinHandle<()>>,
     stats: Arc<TunnelStats>,
     reconnect: Arc<tokio::sync::Notify>,
+    tun_fd: Arc<TunFdSlot>,
 }
 
 unsafe fn cstr(p: *const c_char) -> Option<String> {
@@ -194,6 +195,7 @@ pub unsafe extern "C" fn masque_client_ip_start(
     let sni = cstr(sni);
     let stats = Arc::new(TunnelStats::default());
     let reconnect = Arc::new(tokio::sync::Notify::new());
+    let tun_fd_slot = Arc::new(TunFdSlot::new(tun_fd));
 
     let config = IpClientConfig {
         proxy_url,
@@ -205,7 +207,7 @@ pub unsafe extern "C" fn masque_client_ip_start(
         tun_name: None,
         redirect_gateway: false,
         dns: Vec::new(),
-        tun_fd: Some(tun_fd),
+        tun_fd: Some(tun_fd_slot.clone()),
         events: Some(Arc::new(HostEvents { cb: callbacks })),
         stats: Some(stats.clone()),
         reconnect: Some(reconnect.clone()),
@@ -243,7 +245,28 @@ pub unsafe extern "C" fn masque_client_ip_start(
         thread: Some(thread),
         stats,
         reconnect,
+        tun_fd: tun_fd_slot,
     }))
+}
+
+/// Hand the client a replacement TUN fd (a dup of the provider's current utun
+/// fd; the client takes ownership). Call after a tunnel-settings apply rebuilt
+/// the interface (macOS re-points the packet flow at a fresh utun, leaving the
+/// fd passed to start on a dead interface). The client swaps its forwarding
+/// device in place without dropping the QUIC connection. No-op for fd < 0.
+///
+/// # Safety
+/// `handle` must be a live pointer returned by `masque_client_ip_start` (not
+/// yet stopped).
+#[no_mangle]
+pub unsafe extern "C" fn masque_client_ip_update_tun_fd(
+    handle: *const MasqueHandle,
+    tun_fd: RawFd,
+) {
+    if handle.is_null() || tun_fd < 0 {
+        return;
+    }
+    (*handle).tun_fd.replace(tun_fd);
 }
 
 /// Signal the client to drop its current connection and reconnect immediately,

@@ -1,25 +1,43 @@
 //! Platform backend for the CONNECT-IP client's TUN device.
 //!
-//! The desktop backend (macOS / Linux) creates the device and configures its
-//! addresses with tun-rs. On other targets — iOS / tvOS running inside a
-//! `NEPacketTunnelProvider` — the device is adopted from a host-supplied file
-//! descriptor, and addresses / routes / DNS are configured by the host
-//! (`NEIPv4Settings` / `NEIPv4Route` / `NEDNSSettings`), so those operations are
-//! no-ops here. Forwarding I/O (`recv` / `try_send`) is the same `AsyncDevice`
-//! on every platform, so it stays in `ip_client`.
+//! Two ownership models:
+//!
+//! - **Self-managed** (desktop CLI, macOS / Linux, no host fd): the client
+//!   creates the device and configures its addresses with tun-rs.
+//! - **Host-managed** (a `NEPacketTunnelProvider` on iOS / tvOS / macOS): the
+//!   device is adopted from a host-supplied file descriptor, and addresses /
+//!   routes / DNS are configured by the host (`NEIPv4Settings` / `NEIPv4Route` /
+//!   `NEDNSSettings`). A provided fd always wins — the macOS network system
+//!   extension's sandbox denies creating a new utun (EPERM), so ignoring the fd
+//!   there breaks every connection at ADDRESS_ASSIGN time.
+//!
+//! Forwarding I/O (`recv` / `try_send`) is the same `AsyncDevice` on every
+//! platform, so it stays in `ip_client`.
 
 use std::net::IpAddr;
 
 use tun_rs::AsyncDevice;
 
-/// Bring up the TUN device carrying `addrs` (desktop: create it with tun-rs).
+/// Adopt a host-provided utun fd as the forwarding device.
+///
+/// Safety: the host guarantees the fd is a valid, open utun descriptor and
+/// hands ownership to the tunnel (it is closed when the device drops).
+pub fn adopt_device(fd: std::os::fd::RawFd) -> std::io::Result<AsyncDevice> {
+    unsafe { AsyncDevice::from_fd(fd) }
+}
+
+/// Bring up the TUN device carrying `addrs`: adopt the host-supplied fd when
+/// there is one (NE provider), otherwise create the device with tun-rs.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub fn create_device(
     addrs: &[(IpAddr, u8)],
     mtu: u16,
     tun_name: Option<&str>,
-    _fd: Option<std::os::fd::RawFd>,
+    fd: Option<std::os::fd::RawFd>,
 ) -> Result<AsyncDevice, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(fd) = fd {
+        return Ok(adopt_device(fd)?);
+    }
     let mut builder = tun_rs::DeviceBuilder::new().mtu(mtu);
     // On macOS/BSD, tun-rs otherwise installs a host route whose gateway is the
     // assigned address itself; macOS rejects it (EADDRNOTAVAIL) with a noisy
@@ -45,9 +63,8 @@ pub fn create_device(
     Ok(builder.build_async()?)
 }
 
-/// iOS / tvOS: the TUN comes from `NEPacketTunnelProvider`, handed in as a file
-/// descriptor by the FFI layer. Step 2 replaces this stub with
-/// `AsyncDevice::from_fd(host_fd)`; addresses are configured by the host.
+/// iOS / tvOS: the TUN always comes from `NEPacketTunnelProvider`, handed in as
+/// a file descriptor by the FFI layer; addresses are configured by the host.
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn create_device(
     _addrs: &[(IpAddr, u8)],
@@ -58,9 +75,7 @@ pub fn create_device(
     let fd = fd.ok_or(
         "CONNECT-IP on this platform needs a host-provided TUN fd (NEPacketTunnelProvider)",
     )?;
-    // Safety: the host guarantees `fd` is a valid, open utun descriptor and
-    // hands ownership to the tunnel for its lifetime.
-    Ok(unsafe { AsyncDevice::from_fd(fd)? })
+    Ok(adopt_device(fd)?)
 }
 
 /// The device's interface name, for logging and desktop route commands.

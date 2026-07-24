@@ -37,9 +37,13 @@ pub struct IpClientConfig {
     pub redirect_gateway: bool,
     /// System DNS resolver(s) to install while the tunnel is up (empty = off).
     pub dns: Vec<std::net::IpAddr>,
-    /// iOS/tvOS: adopt this TUN fd (from `NEPacketTunnelProvider`) instead of
-    /// creating a device with tun-rs. Ignored on desktop.
-    pub tun_fd: Option<std::os::fd::RawFd>,
+    /// Adopt the host-provided TUN fd in this slot (from
+    /// `NEPacketTunnelProvider` on iOS/tvOS/macOS) instead of creating a device
+    /// with tun-rs. When set, the device is host-managed: the host also
+    /// programs its addresses, so the client never runs tun-rs address
+    /// operations on it. The host may push a replacement fd into the slot at
+    /// any time (see `TunFdSlot`).
+    pub tun_fd: Option<std::sync::Arc<TunFdSlot>>,
     /// Host callbacks that program the platform config the Rust core does not
     /// do itself (iOS/tvOS: `NEIPv4Settings` / routes / DNS). `None` on desktop,
     /// where the client configures the TUN, routes, and DNS directly.
@@ -60,6 +64,48 @@ pub struct TunnelStats {
     pub rx: std::sync::atomic::AtomicU64,
 }
 
+/// Host-updatable TUN fd for host-managed devices. On macOS, applying the real
+/// tunnel settings can rebuild the utun and re-point the packet flow at a new
+/// interface, invalidating the fd handed to start — the host then pushes a
+/// replacement fd here and the forwarding loop swaps its device in place
+/// without dropping the QUIC connection.
+pub struct TunFdSlot {
+    fd: std::sync::atomic::AtomicI32,
+    changed: tokio::sync::Notify,
+}
+
+impl TunFdSlot {
+    pub fn new(fd: std::os::fd::RawFd) -> Self {
+        Self {
+            fd: std::sync::atomic::AtomicI32::new(fd),
+            changed: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// Replace the fd (ownership transfers to the tunnel) and wake the
+    /// forwarding loop so it adopts the new device.
+    pub fn replace(&self, fd: std::os::fd::RawFd) {
+        self.fd.store(fd, std::sync::atomic::Ordering::Release);
+        self.changed.notify_one();
+    }
+
+    fn current(&self) -> std::os::fd::RawFd {
+        self.fd.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    async fn changed(&self) {
+        self.changed.notified().await
+    }
+}
+
+/// Await a host fd replacement, or pend forever for self-managed devices.
+async fn wait_tun_fd_change(slot: Option<&Arc<TunFdSlot>>) {
+    match slot {
+        Some(s) => s.changed().await,
+        None => std::future::pending().await,
+    }
+}
+
 /// Host-side configuration callbacks. On iOS/tvOS the `NEPacketTunnelProvider`
 /// uses these to program addresses and routes/DNS from the proxy's capsules; on
 /// desktop they are unset and the client programs everything itself.
@@ -74,10 +120,13 @@ pub trait ClientEvents: Send + Sync {
     fn dns_assigned(&self, _servers: &[IpAddr]) {}
 }
 
-/// The active TUN device plus the assignment it was configured with.
+/// The active TUN device plus the assignment it was configured with. `fd` is
+/// the adopted host fd (`None` for self-managed tun-rs devices), used to skip
+/// re-adopting a fd the device already owns.
 struct TunBinding {
     dev: Arc<AsyncDevice>,
     addrs: Vec<(IpAddr, u8)>,
+    fd: Option<std::os::fd::RawFd>,
 }
 
 /// Await the host's immediate-reconnect signal, or pend forever when none is
@@ -339,6 +388,8 @@ enum Event {
     /// A downstream QUIC DATAGRAM, or `None` when the connection closes.
     Datagram(Option<Bytes>),
     Tun(std::io::Result<usize>),
+    /// The host pushed a replacement TUN fd into the slot.
+    TunFdChanged,
     AssignTimeout,
 }
 
@@ -469,6 +520,7 @@ async fn run_tunnel(
                     None => std::future::pending().await,
                 }
             } => Event::Tun(r),
+            _ = wait_tun_fd_change(config.tun_fd.as_ref()) => Event::TunFdChanged,
             _ = tokio::time::sleep_until(assign_deadline), if !ever_assigned => Event::AssignTimeout,
         };
 
@@ -535,6 +587,27 @@ async fn run_tunnel(
                         log::trace!("[client] drop oversized datagram: {n} bytes")
                     }
                     Err(e) => return Err(e.into()),
+                }
+            }
+            Event::TunFdChanged => {
+                // Swap the forwarding device onto the replacement fd, keeping
+                // the QUIC connection and the assigned address set. If no
+                // device exists yet, the slot value is simply picked up by the
+                // next create_device.
+                if let (Some(slot), Some(binding)) = (config.tun_fd.as_ref(), tun.as_mut()) {
+                    let fd = slot.current();
+                    if fd >= 0 && binding.fd != Some(fd) {
+                        match crate::tun_platform::adopt_device(fd) {
+                            Ok(dev) => {
+                                binding.dev = Arc::new(dev);
+                                binding.fd = Some(fd);
+                                log::info!("[client] adopted replacement TUN fd from host");
+                            }
+                            Err(e) => {
+                                return Err(format!("adopting replacement TUN fd failed: {e}").into())
+                            }
+                        }
+                    }
                 }
             }
             Event::AssignTimeout => {
@@ -673,11 +746,12 @@ fn apply_address_assign(
             if new_addrs.is_empty() {
                 return Ok(()); // no device and no addresses — nothing to do
             }
+            let host_fd = config.tun_fd.as_ref().map(|slot| slot.current());
             let dev = crate::tun_platform::create_device(
                 new_addrs,
                 config.mtu,
                 config.tun_name.as_deref(),
-                config.tun_fd,
+                host_fd,
             )?;
             let name = crate::tun_platform::device_name(&dev);
             log::info!(
@@ -688,6 +762,7 @@ fn apply_address_assign(
             *tun = Some(TunBinding {
                 dev: Arc::new(dev),
                 addrs: new_addrs.to_vec(),
+                fd: host_fd,
             });
         }
         Some(binding) => {
@@ -704,15 +779,20 @@ fn apply_address_assign(
             }
             // Incremental diff: add new addresses, remove withdrawn ones,
             // keeping the device (its name and installed routes) intact.
-            let cur: std::collections::HashSet<(IpAddr, u8)> =
-                binding.addrs.iter().copied().collect();
-            let want: std::collections::HashSet<(IpAddr, u8)> =
-                new_addrs.iter().copied().collect();
-            for (addr, prefix) in new_addrs.iter().filter(|a| !cur.contains(a)) {
-                crate::tun_platform::add_address(&binding.dev, *addr, *prefix)?;
-            }
-            for (addr, _prefix) in binding.addrs.iter().filter(|a| !want.contains(a)) {
-                crate::tun_platform::remove_address(&binding.dev, *addr)?;
+            // Host-managed devices (adopted fd) are skipped: the host programs
+            // addresses from the `addresses_assigned` callback, and tun-rs
+            // ioctls on the adopted utun are denied in the NE sandbox anyway.
+            if config.tun_fd.is_none() {
+                let cur: std::collections::HashSet<(IpAddr, u8)> =
+                    binding.addrs.iter().copied().collect();
+                let want: std::collections::HashSet<(IpAddr, u8)> =
+                    new_addrs.iter().copied().collect();
+                for (addr, prefix) in new_addrs.iter().filter(|a| !cur.contains(a)) {
+                    crate::tun_platform::add_address(&binding.dev, *addr, *prefix)?;
+                }
+                for (addr, _prefix) in binding.addrs.iter().filter(|a| !want.contains(a)) {
+                    crate::tun_platform::remove_address(&binding.dev, *addr)?;
+                }
             }
             binding.addrs = new_addrs.to_vec();
             log::info!("[client] address set updated: {}", fmt_addrs(new_addrs));
