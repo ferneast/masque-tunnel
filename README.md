@@ -126,7 +126,9 @@ CONNECT-UDP is always served. CONNECT-IP is enabled only when `--ip-pool` and/or
 
 ### DNS assignment (`--dns-assign`)
 
-RFC 9484 assigns addresses and routes but no resolver, so a CONNECT-IP client otherwise needs `--dns` to know what DNS to use. `--dns-assign <addr>` (repeatable, IPv4/IPv6) makes the server advertise resolvers in a **DNS_ASSIGN capsule** ([draft-ietf-masque-connect-ip-dns](https://datatracker.ietf.org/doc/draft-ietf-masque-connect-ip-dns/)); a client that wasn't given its own `--dns` adopts them automatically. This is a minimal profile (plain Do53 addresses — no encrypted-DNS/SVCB or search domains yet) and uses the draft's **provisional** capsule codepoint, which will change when the draft becomes an RFC.
+RFC 9484 assigns addresses and routes but no resolver, so a CONNECT-IP client otherwise needs `--dns` to know what DNS to use. `--dns-assign <addr>` (repeatable, IPv4/IPv6) makes the server advertise resolvers in a **DNS_ASSIGN capsule** ([draft-ietf-masque-connect-ip-dns](https://datatracker.ietf.org/doc/draft-ietf-masque-connect-ip-dns/)); a client that wasn't given its own `--dns` adopts them automatically. This is a minimal profile (plain Do53 addresses — no encrypted-DNS/SVCB or search domains yet).
+
+The draft has no IANA-assigned capsule type yet, so both ends hardcode a **provisional codepoint `0x1ACE_79EC`** (`CAPSULE_DNS_ASSIGN` in `src/capsule.rs`). This is a private-use value picked to avoid colliding with RFC 9484's registered types (`0x00`–`0x03`); it **must** be changed to the assigned codepoint once the draft is published as an RFC, and it is not interoperable with any other implementation until then.
 
 ### Split tunnel (`--ip-routes-file`)
 
@@ -300,6 +302,45 @@ apps ──▶ TUN ──▶ client ──QUIC/H3──▶ server ──▶ TUN 
 3. Server answers with an `ADDRESS_ASSIGN` (a /32 and/or /128 from its pool, echoing the Request IDs) plus a `ROUTE_ADVERTISEMENT` for the default route (RFC 9484 capsules).
 4. Client brings up a TUN with the assigned address; IP packets travel as QUIC DATAGRAMs (context-id 0), while capsules travel on the request stream.
 5. The server writes upstream packets to a shared TUN (source-validated against the assigned address) and routes downstream packets by destination; the kernel handles forwarding, NAT, and the hop-count decrement.
+
+## Standards conformance
+
+The CONNECT-IP implementation targets the full-tunnel VPN case. It implements
+extended CONNECT with `:protocol = connect-ip`, the Capsule Protocol
+([RFC 9297](https://datatracker.ietf.org/doc/html/rfc9297)) with unknown-type
+skipping, the `ADDRESS_ASSIGN` / `ADDRESS_REQUEST` / `ROUTE_ADVERTISEMENT`
+capsules ([RFC 9484 §4.7](https://datatracker.ietf.org/doc/html/rfc9484#section-4.7)),
+IP packets in HTTP Datagrams (context ID 0), dual-stack addressing,
+source-address validation of upstream packets
+([§8.1](https://datatracker.ietf.org/doc/html/rfc9484#section-8.1)), and the ICMP
+Packet Too Big / hop-limit handling of
+[§7.1](https://datatracker.ietf.org/doc/html/rfc9484#section-7.1).
+
+Relative to RFC 9484, the following is **not** implemented:
+
+- **Scoped requests.** Only the full-tunnel wildcard request
+  (`/.well-known/masque/ip/*/*/`, target and IP protocol both `*`) is served. A
+  request naming a specific target IP or IP protocol is rejected with `400`
+  ([§4.1](https://datatracker.ietf.org/doc/html/rfc9484#section-4.1) permits a
+  proxy to refuse these). There is no per-flow or per-protocol packet filtering.
+- **Client-requested specific addresses.** The server pre-assigns one host
+  address per family, sequentially from its pool, and answers `ADDRESS_REQUEST`
+  only from that pre-assigned set. A request for a specific address the client
+  was not already assigned — or for a non-host prefix length — is refused with an
+  all-zero `AssignedAddress`. There is no on-demand allocation or renumbering.
+- **Per-protocol routes.** `ROUTE_ADVERTISEMENT` always uses IP Protocol `0`
+  (all protocols); the per-protocol scoping the capsule allows is not produced.
+- **Bidirectional / client-as-router.** The client only consumes
+  `ADDRESS_ASSIGN` and `ROUTE_ADVERTISEMENT`; it never advertises routes to the
+  server and ignores an inbound `ADDRESS_REQUEST`. The symmetric site-to-site
+  model (either endpoint routing on the other's behalf) is not implemented.
+- **ECN.** ECN bits are not mapped between the inner IP packet and the outer
+  QUIC datagram ([RFC 6040](https://datatracker.ietf.org/doc/html/rfc6040)).
+
+**DNS assignment** is a separate, non-RFC extension via
+[draft-ietf-masque-connect-ip-dns](https://datatracker.ietf.org/doc/draft-ietf-masque-connect-ip-dns/)
+using a provisional capsule codepoint — see
+[DNS assignment](#dns-assignment---dns-assign) above.
 
 ## License
 
