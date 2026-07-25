@@ -475,25 +475,38 @@ async fn run_tunnel(
     // reconnect loop resets its backoff floor.
     *established = true;
 
-    // Interactive assignment (RFC 9484 §4.7.2): request one address per family
-    // (all-zero address = no preference) instead of waiting for an unprompted
-    // ADDRESS_ASSIGN. The server answers with the complete assigned set,
-    // refusing a family it cannot serve with an all-zero entry.
+    // Interactive assignment (RFC 9484 §4.7.2): request one address per family.
+    // On a reconnect we ask for the addresses we already hold, so the proxy
+    // keeps this client's tunnel IP stable across reconnects. Stability avoids
+    // renumbering the TUN and, crucially, keeps the client's and proxy's view of
+    // the address in sync even if the resulting ADDRESS_ASSIGN is lost — nothing
+    // changed, so a lost capsule is harmless. The first connect holds no address
+    // yet and expresses no preference (all-zero); a proxy that cannot honor the
+    // preference simply appends its own choice at Request ID 0, so an older proxy
+    // still assigns normally.
+    let held_v4 = tun
+        .as_ref()
+        .and_then(|b| b.addrs.iter().find(|(a, _)| a.is_ipv4()).map(|(a, _)| *a))
+        .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    let held_v6 = tun
+        .as_ref()
+        .and_then(|b| b.addrs.iter().find(|(a, _)| a.is_ipv6()).map(|(a, _)| *a))
+        .unwrap_or(IpAddr::V6(Ipv6Addr::UNSPECIFIED));
     stream
         .send_data(encode_address_request(&[
             RequestedAddress {
                 request_id: 1,
-                addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                addr: held_v4,
                 prefix_len: 32,
             },
             RequestedAddress {
                 request_id: 2,
-                addr: IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+                addr: held_v6,
                 prefix_len: 128,
             },
         ]))
         .await?;
-    log::debug!("[client] sent ADDRESS_REQUEST (v4 + v6, no preference)");
+    log::debug!("[client] sent ADDRESS_REQUEST (v4={held_v4}, v6={held_v6})");
 
     let mut parser = CapsuleParser::default();
     let mut pkt_buf = vec![0u8; config.mtu.max(1280) as usize + 64];

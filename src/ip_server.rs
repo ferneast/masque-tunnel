@@ -12,6 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use bytes::{Buf, Bytes};
@@ -20,6 +21,13 @@ use tun_rs::AsyncDevice;
 
 use crate::capsule::*;
 use crate::common::*;
+
+/// Monotonic per-session generation, stamped into every `DownstreamFlow` so a
+/// session's cleanup only reclaims routes/addresses it still owns. When a
+/// reconnecting client's address is taken over by a newer session, the older
+/// session's generation no longer matches the route entry and its guard leaves
+/// that entry alone.
+static NEXT_SESSION_GEN: AtomicU64 = AtomicU64::new(1);
 
 /// The full bidirectional request stream of a CONNECT-IP request.
 pub type H3RequestStream = h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
@@ -105,11 +113,42 @@ impl AddressPool {
     }
 
     fn free(&mut self, ip: IpAddr) {
-        let v = match ip {
-            IpAddr::V4(v4) => u32::from(v4) as u128,
-            IpAddr::V6(v6) => u128::from(v6),
+        self.in_use.remove(&addr_to_u128(ip));
+    }
+
+    /// True if `ip` is a client host address of this pool: same family, within
+    /// the prefix, and not the network, server (network+1), or IPv4 broadcast
+    /// address. Used to validate a client's specifically requested address.
+    fn is_client_addr(&self, ip: IpAddr) -> bool {
+        if ip.is_ipv6() != self.is_v6 {
+            return false;
+        }
+        let v = addr_to_u128(ip);
+        let Some(span) = 1u128.checked_shl(self.host_bits) else {
+            return v > self.network; // host_bits >= 128: effectively unbounded
         };
-        self.in_use.remove(&v);
+        let first = self.network.saturating_add(2); // skip network + server
+        let broadcast_reserve = if self.is_v6 { 0 } else { 1 };
+        let last = self
+            .network
+            .saturating_add(span)
+            .saturating_sub(1 + broadcast_reserve);
+        v >= first && v <= last
+    }
+
+    /// Mark a specific address as in use. Returns true if it was free (newly
+    /// taken), false if it was already in use (the caller may take it over from
+    /// a stale session). The caller must have validated it with `is_client_addr`.
+    fn take(&mut self, ip: IpAddr) -> bool {
+        self.in_use.insert(addr_to_u128(ip))
+    }
+}
+
+/// Map an address to the u128 key the pools use (IPv4 in the low 32 bits).
+fn addr_to_u128(ip: IpAddr) -> u128 {
+    match ip {
+        IpAddr::V4(v4) => u32::from(v4) as u128,
+        IpAddr::V6(v6) => u128::from(v6),
     }
 }
 
@@ -121,6 +160,9 @@ impl AddressPool {
 struct DownstreamFlow {
     conn: quinn::Connection,
     stream_id: u64,
+    /// Owning session generation (see `NEXT_SESSION_GEN`); a session's cleanup
+    /// only reclaims a route entry whose generation still matches its own.
+    gen: u64,
 }
 
 /// Shared CONNECT-IP state. Global across QUIC connections: the TUN device
@@ -149,6 +191,25 @@ impl IpTunState {
         if let Some(p) = pool {
             p.lock().unwrap().free(ip);
         }
+    }
+
+    /// Grant a client's specifically requested address (RFC 9484 §4.7.2) of the
+    /// given family when it is a valid client address in the pool. Returns the
+    /// address and whether it was taken over from a prior owner (already in
+    /// use). Returns `None` when the address is not a grantable client address,
+    /// leaving the caller with its provisional assignment.
+    fn grant_specific(&self, want_v6: bool, want: IpAddr) -> Option<(IpAddr, bool)> {
+        if want.is_ipv6() != want_v6 {
+            return None;
+        }
+        let pool = if want_v6 { &self.pool_v6 } else { &self.pool_v4 };
+        let pool = pool.as_ref()?;
+        let mut p = pool.lock().unwrap();
+        if !p.is_client_addr(want) {
+            return None;
+        }
+        let newly_taken = p.take(want);
+        Some((want, !newly_taken))
     }
 }
 
@@ -473,24 +534,42 @@ pub fn init(config: &IpConfig) -> Result<Arc<IpTunState>, Box<dyn std::error::Er
     Ok(state)
 }
 
-/// Cleans up a session's routes and pool allocations when dropped.
+/// The shared, mutable set of addresses a session currently holds. Shared
+/// between the capsule loop (which may swap in a client's requested address),
+/// upstream source validation, and the cleanup guard.
+type SharedAssigned = Arc<Mutex<Vec<IpAddr>>>;
+
+/// Cleans up a session's routes and pool allocations when dropped. Only entries
+/// this session still owns (matching generation) are reclaimed, so an address
+/// already taken over by a newer session is left untouched.
 struct IpSessionGuard {
-    assigned: Vec<IpAddr>,
+    assigned: SharedAssigned,
     state: Arc<IpTunState>,
+    gen: u64,
 }
 
 impl Drop for IpSessionGuard {
     fn drop(&mut self) {
-        {
+        let freed: Vec<IpAddr> = {
             let mut routes = self.state.routes.write().unwrap();
-            for ip in &self.assigned {
-                routes.remove(ip);
-            }
-        }
-        for ip in &self.assigned {
+            let assigned = self.assigned.lock().unwrap();
+            assigned
+                .iter()
+                .copied()
+                .filter(|ip| {
+                    if routes.get(ip).map(|f| f.gen) == Some(self.gen) {
+                        routes.remove(ip);
+                        true
+                    } else {
+                        false // taken over by a newer session; not ours to free
+                    }
+                })
+                .collect()
+        };
+        for ip in &freed {
             self.state.free(*ip);
         }
-        log::info!("[server] CONNECT-IP session released: {:?}", self.assigned);
+        log::info!("[server] CONNECT-IP session released: {freed:?}");
     }
 }
 
@@ -499,7 +578,7 @@ impl Drop for IpSessionGuard {
 /// aborts the capsule task, whose guard frees routes and pool addresses.
 pub struct IpSession {
     tun: Arc<AsyncDevice>,
-    assigned: Vec<IpAddr>,
+    assigned: SharedAssigned,
     capsule: tokio::task::AbortHandle,
 }
 
@@ -510,15 +589,15 @@ impl IpSession {
         if context_id != 0 {
             return;
         }
-        match packet_src(pkt) {
+        let source_ok = match packet_src(pkt) {
+            Some(src) => self.assigned.lock().unwrap().contains(&src),
+            None => false,
+        };
+        if source_ok {
             // try_send: never block; a full TUN queue drops, which IP tolerates.
-            Some(src) if self.assigned.contains(&src) => {
-                let _ = self.tun.try_send(pkt);
-            }
-            _ => log::trace!(
-                "[server] drop packet with invalid source (assigned {:?})",
-                self.assigned
-            ),
+            let _ = self.tun.try_send(pkt);
+        } else {
+            log::trace!("[server] drop packet with invalid source");
         }
     }
 }
@@ -526,6 +605,77 @@ impl IpSession {
 impl Drop for IpSession {
     fn drop(&mut self) {
         self.capsule.abort();
+    }
+}
+
+/// Per-session context handed to the capsule loop: the mutable assigned-address
+/// set (also read by upstream validation and the cleanup guard) plus this
+/// session's downstream identity, used to (re)install and evict route entries.
+struct SessionCtx {
+    assigned: SharedAssigned,
+    state: Arc<IpTunState>,
+    conn: quinn::Connection,
+    stream_id: u64,
+    gen: u64,
+}
+
+impl SessionCtx {
+    fn downstream_flow(&self) -> DownstreamFlow {
+        DownstreamFlow {
+            conn: self.conn.clone(),
+            stream_id: self.stream_id,
+            gen: self.gen,
+        }
+    }
+}
+
+/// Apply any specific (non-wildcard) requested address from an ADDRESS_REQUEST,
+/// swapping it in for this session's provisionally assigned address of the same
+/// family. A requested address still held by a stale session (its QUIC
+/// connection not yet reaped) is taken over: the route entry is repointed here,
+/// and the prior owner's generation-keyed cleanup then leaves it alone. Invalid
+/// or non-grantable preferences are ignored, keeping the provisional assignment.
+fn honor_requested_addresses(ctx: &SessionCtx, requests: &[RequestedAddress]) {
+    for r in requests {
+        if r.addr.is_unspecified() {
+            continue; // no preference
+        }
+        let want_v6 = r.addr.is_ipv6();
+        if ctx.assigned.lock().unwrap().contains(&r.addr) {
+            continue; // already held by this session
+        }
+        let Some((granted, evicted)) = ctx.state.grant_specific(want_v6, r.addr) else {
+            continue; // not a grantable client address; keep the provisional one
+        };
+        // Swap the granted address in for the provisional same-family one,
+        // repointing the downstream route (evicting any stale owner). Locks are
+        // released before touching the pool to keep a single routes→assigned→pool
+        // acquisition order across the file.
+        let old_to_free = {
+            let mut routes = ctx.state.routes.write().unwrap();
+            let mut assigned = ctx.assigned.lock().unwrap();
+            let old = if let Some(pos) = assigned.iter().position(|a| a.is_ipv6() == want_v6) {
+                let old = assigned[pos];
+                if routes.get(&old).map(|f| f.gen) == Some(ctx.gen) {
+                    routes.remove(&old);
+                }
+                assigned[pos] = granted;
+                Some(old)
+            } else {
+                assigned.push(granted);
+                None
+            };
+            routes.insert(granted, ctx.downstream_flow());
+            old
+        };
+        if let Some(old) = old_to_free {
+            ctx.state.free(old);
+        }
+        if evicted {
+            log::info!("[server] CONNECT-IP took over {granted} for a reconnecting client (evicted stale session)");
+        } else {
+            log::info!("[server] CONNECT-IP honored requested address {granted}");
+        }
     }
 }
 
@@ -561,24 +711,21 @@ pub async fn handle_ip_request(
         return None;
     }
 
-    // Assign one address per configured family.
-    let mut assigned: Vec<(IpAddr, u8)> = Vec::new();
+    // Provisionally assign one address per configured family. A specific
+    // ADDRESS_REQUEST may later swap these for the client's preferred addresses
+    // (see honor_requested_addresses).
+    let mut assigned_ips: Vec<IpAddr> = Vec::new();
     if let Some(ip) = state.alloc(false) {
-        assigned.push((ip, 32));
+        assigned_ips.push(ip);
     }
     if let Some(ip) = state.alloc(true) {
-        assigned.push((ip, 128));
+        assigned_ips.push(ip);
     }
-    if assigned.is_empty() {
+    if assigned_ips.is_empty() {
         log::warn!("[server] CONNECT-IP address pool exhausted");
         reply_error(&mut stream, 503).await;
         return None;
     }
-    let free_all = |state: &Arc<IpTunState>| {
-        for (ip, _) in &assigned {
-            state.free(*ip);
-        }
-    };
 
     // 200 response only. The addresses are reserved here (pool exhaustion is
     // rejected with 503 before the 200), but announced from the capsule loop
@@ -592,16 +739,19 @@ pub async fn handle_ip_request(
         .unwrap();
     if let Err(e) = stream.send_response(resp).await {
         log::error!("[server] Failed to send CONNECT-IP 200: {e}");
-        free_all(state);
+        for ip in &assigned_ips {
+            state.free(*ip);
+        }
         return None;
     }
+
+    let gen = NEXT_SESSION_GEN.fetch_add(1, Ordering::Relaxed);
 
     // h3's StreamId::index() is the stream's ordinal (raw QUIC stream ID / 4
     // for client-initiated bidi), which is exactly the RFC 9297 quarter
     // stream ID; the raw QUIC stream ID is index * 4.
     let h3_index = stream.send_id().index();
     let quic_stream_id = h3_index * 4;
-    let assigned_ips: Vec<IpAddr> = assigned.iter().map(|(ip, _)| *ip).collect();
     log::info!(
         "[server] CONNECT-IP established: stream_id={quic_stream_id} assigned={assigned_ips:?}"
     );
@@ -614,25 +764,37 @@ pub async fn handle_ip_request(
                 DownstreamFlow {
                     conn: conn.clone(),
                     stream_id: quic_stream_id,
+                    gen,
                 },
             );
         }
     }
 
+    // The assigned set is shared: the capsule loop may mutate it (honoring a
+    // requested address), upstream source validation reads it, and the guard
+    // reclaims it on teardown.
+    let assigned: SharedAssigned = Arc::new(Mutex::new(assigned_ips));
+
     // Capsule task: reads capsules off the request stream until FIN/reset,
     // then the guard drops (cleaning routes + pool) and the session entry is
     // removed from the connection's map via cleanup_tx.
     let guard = IpSessionGuard {
-        assigned: assigned_ips.clone(),
+        assigned: assigned.clone(),
         state: state.clone(),
+        gen,
     };
     let (send_half, recv_half) = stream.split();
     let cleanup = cleanup_tx.clone();
-    let capsule_assigned = assigned.clone();
-    let capsule_state = state.clone();
+    let ctx = SessionCtx {
+        assigned: assigned.clone(),
+        state: state.clone(),
+        conn: conn.clone(),
+        stream_id: quic_stream_id,
+        gen,
+    };
     let handle = tokio::spawn(async move {
         let _guard = guard;
-        capsule_loop(recv_half, send_half, capsule_assigned, capsule_state).await;
+        capsule_loop(recv_half, send_half, ctx).await;
         let _ = cleanup.send(quic_stream_id).await;
     });
 
@@ -640,7 +802,7 @@ pub async fn handle_ip_request(
         quic_stream_id,
         IpSession {
             tun: state.tun.clone(),
-            assigned: assigned_ips,
+            assigned,
             capsule: handle.abort_handle(),
         },
     ))
@@ -650,12 +812,7 @@ pub async fn handle_ip_request(
 /// ADDRESS_REQUESTs; the first answered request also triggers the
 /// ROUTE_ADVERTISEMENT and DNS_ASSIGN capsules. Ends on FIN/reset, which
 /// tears the session down.
-async fn capsule_loop(
-    mut recv: H3RecvHalf,
-    mut send: H3SendHalf,
-    assigned: Vec<(IpAddr, u8)>,
-    state: Arc<IpTunState>,
-) {
+async fn capsule_loop(mut recv: H3RecvHalf, mut send: H3SendHalf, ctx: SessionCtx) {
     let mut parser = CapsuleParser::default();
     let mut announced = false;
     loop {
@@ -670,12 +827,11 @@ async fn capsule_loop(
                 loop {
                     match parser.next_capsule() {
                         Ok(Some(capsule)) => {
-                            handle_capsule(&mut send, capsule, &assigned, &state, &mut announced)
-                                .await
+                            handle_capsule(&mut send, capsule, &ctx, &mut announced).await
                         }
                         Ok(None) => break,
                         Err(e) => {
-                            log::warn!("[server] Malformed capsule from {assigned:?}: {e}");
+                            log::warn!("[server] Malformed capsule: {e}");
                             return;
                         }
                     }
@@ -693,32 +849,37 @@ async fn capsule_loop(
 async fn handle_capsule(
     send: &mut H3SendHalf,
     capsule: Capsule,
-    assigned: &[(IpAddr, u8)],
-    state: &Arc<IpTunState>,
+    ctx: &SessionCtx,
     announced: &mut bool,
 ) {
     match capsule.capsule_type {
         CAPSULE_ADDRESS_REQUEST => {
             let Some(requests) = parse_address_request(&capsule.payload) else {
-                log::warn!("[server] Malformed ADDRESS_REQUEST from {assigned:?}");
+                log::warn!("[server] Malformed ADDRESS_REQUEST");
                 return;
             };
             if requests.is_empty() {
-                log::warn!("[server] Empty ADDRESS_REQUEST from {assigned:?}");
+                log::warn!("[server] Empty ADDRESS_REQUEST");
                 return;
             }
-            // Answer each request with the already-reserved address of the
-            // matching family for a no-preference (or exact-match) request,
-            // and refuse anything else with the all-zero address + max prefix
-            // length (RFC 9484 §4.7.1). ADDRESS_ASSIGN must carry the complete
-            // assigned set, so any address not claimed by a request is appended
-            // with Request ID 0.
+            // Swap in any specifically requested address (keeps a reconnecting
+            // client's tunnel IP stable) before composing the answer, so the
+            // ADDRESS_ASSIGN and routes reflect the honored set.
+            honor_requested_addresses(ctx, &requests);
+            let assigned: Vec<IpAddr> = ctx.assigned.lock().unwrap().clone();
+
+            // Answer each request with the assigned address of the matching
+            // family for a no-preference (or exact-match) request, and refuse
+            // anything else with the all-zero address + max prefix length
+            // (RFC 9484 §4.7.1). ADDRESS_ASSIGN must carry the complete assigned
+            // set, so any address not claimed by a request is appended with
+            // Request ID 0.
             let mut out = Vec::new();
             let mut claimed: Vec<IpAddr> = Vec::new();
             for r in &requests {
                 let want_v6 = r.addr.is_ipv6();
                 let no_pref = r.addr.is_unspecified();
-                let matched = assigned.iter().map(|(a, _)| *a).find(|a| {
+                let matched = assigned.iter().copied().find(|a| {
                     a.is_ipv6() == want_v6 && (no_pref || *a == r.addr) && !claimed.contains(a)
                 });
                 if let Some(a) = matched {
@@ -736,7 +897,7 @@ async fn handle_capsule(
                     });
                 }
             }
-            for (a, _) in assigned {
+            for a in &assigned {
                 if !claimed.contains(a) {
                     out.push(AssignedAddress {
                         request_id: 0,
@@ -754,7 +915,9 @@ async fn handle_capsule(
             // arrive before an address).
             if !*announced {
                 *announced = true;
-                let ranges = route_ranges(&state.advertised_routes, assigned);
+                let assigned_pfx: Vec<(IpAddr, u8)> =
+                    assigned.iter().map(|a| (*a, max_prefix(*a))).collect();
+                let ranges = route_ranges(&ctx.state.advertised_routes, &assigned_pfx);
                 if send
                     .send_data(encode_route_advertisement(&ranges))
                     .await
@@ -765,9 +928,9 @@ async fn handle_capsule(
                 }
                 // Optionally advertise DNS resolvers
                 // (draft-ietf-masque-connect-ip-dns).
-                if !state.advertised_dns.is_empty()
+                if !ctx.state.advertised_dns.is_empty()
                     && send
-                        .send_data(encode_dns_assign(&state.advertised_dns))
+                        .send_data(encode_dns_assign(&ctx.state.advertised_dns))
                         .await
                         .is_err()
                 {
@@ -780,14 +943,14 @@ async fn handle_capsule(
             // deployment), so client routes are noted and ignored.
             match parse_route_advertisement(&capsule.payload) {
                 Some(ranges) => log::debug!(
-                    "[server] Ignoring ROUTE_ADVERTISEMENT from {assigned:?}: {} range(s)",
+                    "[server] Ignoring ROUTE_ADVERTISEMENT from client: {} range(s)",
                     ranges.len()
                 ),
-                None => log::warn!("[server] Malformed ROUTE_ADVERTISEMENT from {assigned:?}"),
+                None => log::warn!("[server] Malformed ROUTE_ADVERTISEMENT from client"),
             }
         }
         CAPSULE_ADDRESS_ASSIGN => {
-            log::debug!("[server] Ignoring ADDRESS_ASSIGN from client {assigned:?}");
+            log::debug!("[server] Ignoring ADDRESS_ASSIGN from client");
         }
         // Unknown capsule types must be ignored (RFC 9297 §3.2).
         other => log::trace!("[server] Ignoring unknown capsule type {other:#x}"),
@@ -843,6 +1006,40 @@ mod tests {
         pool.free("10.99.0.4".parse().unwrap());
         assert_eq!(pool.alloc(), Some("10.99.0.4".parse().unwrap()));
         assert_eq!(pool.alloc(), None);
+    }
+
+    #[test]
+    fn pool_is_client_addr_and_take_v4() {
+        // /29: network .0, server .1, clients .2-.6, broadcast .7
+        let mut pool = AddressPool::new("10.99.0.0".parse().unwrap(), 29);
+        let c2: IpAddr = "10.99.0.2".parse().unwrap();
+        assert!(pool.is_client_addr(c2));
+        assert!(pool.is_client_addr("10.99.0.6".parse().unwrap()));
+        assert!(!pool.is_client_addr("10.99.0.1".parse().unwrap())); // server
+        assert!(!pool.is_client_addr("10.99.0.0".parse().unwrap())); // network
+        assert!(!pool.is_client_addr("10.99.0.7".parse().unwrap())); // broadcast
+        assert!(!pool.is_client_addr("10.99.0.8".parse().unwrap())); // out of range
+        assert!(!pool.is_client_addr("2001:db8::2".parse().unwrap())); // wrong family
+        // take: free -> true (newly taken), then already-in-use -> false
+        assert!(pool.take(c2));
+        assert!(!pool.take(c2));
+        // a sequential alloc must now skip the taken .2
+        assert_eq!(pool.alloc(), Some("10.99.0.3".parse().unwrap()));
+        // freeing lets take succeed again
+        pool.free(c2);
+        assert!(pool.take(c2));
+    }
+
+    #[test]
+    fn pool_is_client_addr_v6() {
+        // /126: network ::0, server ::1, clients ::2 and ::3
+        let pool = AddressPool::new("2001:db8::".parse().unwrap(), 126);
+        assert!(pool.is_client_addr("2001:db8::2".parse().unwrap()));
+        assert!(pool.is_client_addr("2001:db8::3".parse().unwrap()));
+        assert!(!pool.is_client_addr("2001:db8::1".parse().unwrap())); // server
+        assert!(!pool.is_client_addr("2001:db8::".parse().unwrap())); // network
+        assert!(!pool.is_client_addr("2001:db8::4".parse().unwrap())); // out of range
+        assert!(!pool.is_client_addr("10.99.0.2".parse().unwrap())); // wrong family
     }
 
     #[test]
