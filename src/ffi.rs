@@ -17,8 +17,6 @@ use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use tokio::sync::oneshot;
-
 use crate::capsule::IpAddressRange;
 use crate::ip_client::{self, ClientEvents, IpClientConfig, TunFdSlot, TunnelStats};
 
@@ -153,10 +151,10 @@ fn routes_json(ranges: &[IpAddressRange]) -> String {
     format!("[{}]", items.join(","))
 }
 
-/// Opaque handle owning the worker thread, its shutdown channel, the traffic
-/// counters, and the immediate-reconnect signal.
+/// Opaque handle owning the worker thread, its graceful-shutdown signal, the
+/// traffic counters, and the immediate-reconnect signal.
 pub struct MasqueHandle {
-    shutdown: Option<oneshot::Sender<()>>,
+    shutdown: Arc<tokio::sync::Notify>,
     thread: Option<std::thread::JoinHandle<()>>,
     stats: Arc<TunnelStats>,
     reconnect: Arc<tokio::sync::Notify>,
@@ -195,6 +193,7 @@ pub unsafe extern "C" fn masque_client_ip_start(
     let sni = cstr(sni);
     let stats = Arc::new(TunnelStats::default());
     let reconnect = Arc::new(tokio::sync::Notify::new());
+    let shutdown = Arc::new(tokio::sync::Notify::new());
     let tun_fd_slot = Arc::new(TunFdSlot::new(tun_fd));
 
     let config = IpClientConfig {
@@ -211,9 +210,9 @@ pub unsafe extern "C" fn masque_client_ip_start(
         events: Some(Arc::new(HostEvents { cb: callbacks })),
         stats: Some(stats.clone()),
         reconnect: Some(reconnect.clone()),
+        shutdown: Some(shutdown.clone()),
     };
 
-    let (tx, rx) = oneshot::channel::<()>();
     let thread = std::thread::spawn(move || {
         let rt = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -227,21 +226,17 @@ pub unsafe extern "C" fn masque_client_ip_start(
         };
         rt.block_on(async move {
             (callbacks.on_state)(callbacks.ctx, 0, std::ptr::null()); // connecting
-            tokio::select! {
-                // `run` loops forever reconnecting; it only returns on a fatal
-                // setup error, which we surface to the host.
-                res = ip_client::run(config) => {
-                    if let Err(e) = res {
-                        report_error(&callbacks, &e.to_string());
-                    }
-                }
-                _ = rx => {} // stop requested: drop the tunnel future, cleaning up
+            // `run` loops forever reconnecting; it returns cleanly once the host
+            // signals shutdown (having closed the connection gracefully), or on a
+            // fatal setup error, which we surface to the host.
+            if let Err(e) = ip_client::run(config).await {
+                report_error(&callbacks, &e.to_string());
             }
         });
     });
 
     Box::into_raw(Box::new(MasqueHandle {
-        shutdown: Some(tx),
+        shutdown,
         thread: Some(thread),
         stats,
         reconnect,
@@ -310,6 +305,10 @@ pub unsafe extern "C" fn masque_client_ip_stats(
 
 /// Stop the client and free the handle. Safe to call once per handle.
 ///
+/// Signals a graceful shutdown — `run` closes the active QUIC connection (so the
+/// proxy releases the assigned address immediately) and returns — then joins the
+/// worker thread. `run`'s shutdown path is bounded, so the join does not block.
+///
 /// # Safety
 /// `handle` must be a pointer returned by `masque_client_ip_start`.
 #[no_mangle]
@@ -318,9 +317,7 @@ pub unsafe extern "C" fn masque_client_ip_stop(handle: *mut MasqueHandle) {
         return;
     }
     let mut handle = Box::from_raw(handle);
-    if let Some(tx) = handle.shutdown.take() {
-        let _ = tx.send(());
-    }
+    handle.shutdown.notify_one();
     if let Some(thread) = handle.thread.take() {
         let _ = thread.join();
     }

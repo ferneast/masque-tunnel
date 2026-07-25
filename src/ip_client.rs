@@ -54,6 +54,11 @@ pub struct IpClientConfig {
     /// (e.g. the iOS provider detected a network interface change), bypassing
     /// the QUIC idle-timeout wait. `None` on desktop.
     pub reconnect: Option<std::sync::Arc<tokio::sync::Notify>>,
+    /// Host signal to shut the client down gracefully: the active QUIC
+    /// connection is closed (sending CONNECTION_CLOSE) so the proxy releases the
+    /// assigned address immediately instead of waiting out its idle timeout,
+    /// then `run` returns. `None` on desktop, where SIGINT/SIGTERM stops it.
+    pub shutdown: Option<std::sync::Arc<tokio::sync::Notify>>,
 }
 
 /// Cumulative tunneled traffic since start: `tx` counts IP bytes sent to the
@@ -138,6 +143,24 @@ async fn wait_reconnect(notify: Option<&std::sync::Arc<tokio::sync::Notify>>) {
     }
 }
 
+/// Await the host's graceful-shutdown signal, or pend forever when none is
+/// wired (desktop CLI, which stops on SIGINT/SIGTERM instead). Only one waiter
+/// observes this at a time (the active `run_tunnel`, else the reconnect
+/// backoff), so a single `notify_one` from the host is never missed.
+async fn wait_shutdown(notify: Option<&std::sync::Arc<tokio::sync::Notify>>) {
+    match notify {
+        Some(n) => n.notified().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Why `run_tunnel` returned. Any error means the tunnel dropped and should be
+/// retried; `Ok(Shutdown)` means the host asked to stop and the connection has
+/// already been closed gracefully, so the reconnect loop must exit.
+enum TunnelExit {
+    Shutdown,
+}
+
 /// Run the MASQUE CONNECT-IP client with automatic reconnection.
 pub async fn run(config: IpClientConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let url = url::Url::parse(&config.proxy_url)?;
@@ -157,6 +180,11 @@ pub async fn run(config: IpClientConfig) -> Result<(), Box<dyn std::error::Error
     let mut routes = crate::route::RouteSet::new();
     let mut dns = crate::dns::DnsGuard::new(config.dns.clone());
 
+    enum Step {
+        Reconnect,
+        Signaled,
+        Shutdown,
+    }
     let reconnect = async {
         let mut backoff_ms = 500u64;
         loop {
@@ -168,7 +196,9 @@ pub async fn run(config: IpClientConfig) -> Result<(), Box<dyn std::error::Error
             // The host (iOS provider) fires it the instant the network path
             // changes, so a Wi-Fi→cellular switch reconnects at once instead of
             // waiting out the ~30s QUIC idle timeout on the dead socket.
-            let signaled = tokio::select! {
+            // run_tunnel itself observes the shutdown signal (to close the
+            // connection gracefully), so it is not raced here.
+            let step = tokio::select! {
                 res = run_tunnel(
                     &config, &client_config, &proxy_host, proxy_port, &sni, &mut tun, &mut routes,
                     &mut dns, &mut established,
@@ -177,23 +207,35 @@ pub async fn run(config: IpClientConfig) -> Result<(), Box<dyn std::error::Error
                         backoff_ms = 500;
                     }
                     match res {
-                        Ok(()) => log::warn!("[client] tunnel ended, reconnecting in {backoff_ms}ms"),
-                        Err(e) => log::warn!("[client] connection lost: {e}, reconnecting in {backoff_ms}ms"),
+                        Ok(TunnelExit::Shutdown) => Step::Shutdown,
+                        Err(e) => {
+                            log::warn!("[client] connection lost: {e}, reconnecting in {backoff_ms}ms");
+                            Step::Reconnect
+                        }
                     }
-                    false
                 }
                 _ = wait_reconnect(config.reconnect.as_ref()) => {
                     log::info!("[client] immediate reconnect requested (network change)");
-                    true
+                    Step::Signaled
                 }
             };
-            if signaled {
-                // New path is up — reconnect right away with no backoff, binding
-                // a fresh socket on the new default interface.
-                backoff_ms = 500;
-                continue;
+            match step {
+                // Graceful shutdown: the connection is already closed; stop.
+                Step::Shutdown => break,
+                Step::Signaled => {
+                    // New path is up — reconnect right away with no backoff,
+                    // binding a fresh socket on the new default interface.
+                    backoff_ms = 500;
+                    continue;
+                }
+                Step::Reconnect => {}
             }
-            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+            // Interruptible backoff: a shutdown during the wait must return
+            // promptly instead of blocking the host's stop for up to the backoff.
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(backoff_ms)) => {}
+                _ = wait_shutdown(config.shutdown.as_ref()) => break,
+            }
             backoff_ms = (backoff_ms * 2).min(30_000);
         }
     };
@@ -391,6 +433,8 @@ enum Event {
     /// The host pushed a replacement TUN fd into the slot.
     TunFdChanged,
     AssignTimeout,
+    /// The host asked to stop; close the connection gracefully and exit.
+    Shutdown,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -404,7 +448,7 @@ async fn run_tunnel(
     routes: &mut crate::route::RouteSet,
     dns: &mut crate::dns::DnsGuard,
     established: &mut bool,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<TunnelExit, Box<dyn std::error::Error + Send + Sync>> {
     let addrs: Vec<SocketAddr> = tokio::net::lookup_host((proxy_host, proxy_port))
         .await?
         .collect();
@@ -425,8 +469,12 @@ async fn run_tunnel(
         None
     };
 
-    let (conn, winning) =
-        establish_connection(addrs, sni, ep_v4.as_ref(), ep_v6.as_ref()).await?;
+    // A shutdown during the handshake needs no graceful close (no address is
+    // assigned yet); just stop, dropping the in-flight connect attempts.
+    let (conn, winning) = tokio::select! {
+        r = establish_connection(addrs, sni, ep_v4.as_ref(), ep_v6.as_ref()) => r?,
+        _ = wait_shutdown(config.shutdown.as_ref()) => return Ok(TunnelExit::Shutdown),
+    };
     let proxy_ip = winning.ip();
     log::info!("[client] QUIC connected to {winning}");
 
@@ -535,6 +583,7 @@ async fn run_tunnel(
             } => Event::Tun(r),
             _ = wait_tun_fd_change(config.tun_fd.as_ref()) => Event::TunFdChanged,
             _ = tokio::time::sleep_until(assign_deadline), if !ever_assigned => Event::AssignTimeout,
+            _ = wait_shutdown(config.shutdown.as_ref()) => Event::Shutdown,
         };
 
         match event {
@@ -625,6 +674,25 @@ async fn run_tunnel(
             }
             Event::AssignTimeout => {
                 return Err("proxy did not assign an address within 10s".into())
+            }
+            Event::Shutdown => {
+                // Close the QUIC connection so the proxy sees an explicit
+                // CONNECTION_CLOSE and releases our assigned address at once,
+                // instead of holding it until its ~30s idle timeout. Drain the
+                // endpoints briefly so the close frame is actually transmitted
+                // before the runtime is torn down; bounded so stop never hangs.
+                conn.close(0u32.into(), b"client stopping");
+                let drain = async {
+                    if let Some(ep) = &ep_v4 {
+                        ep.wait_idle().await;
+                    }
+                    if let Some(ep) = &ep_v6 {
+                        ep.wait_idle().await;
+                    }
+                };
+                let _ = tokio::time::timeout(Duration::from_millis(500), drain).await;
+                log::info!("[client] shutdown: closed connection, releasing address");
+                return Ok(TunnelExit::Shutdown);
             }
         }
     }

@@ -218,6 +218,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 events: None,
                 stats: None,
                 reconnect: None,
+                shutdown: None,
             })
             .await
         }
