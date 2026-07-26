@@ -169,18 +169,24 @@ unsafe fn cstr(p: *const c_char) -> Option<String> {
 }
 
 /// Start the CONNECT-IP client against `proxy_url`, forwarding over `tun_fd`
-/// (a dup of the provider's utun fd). `auth_token` and `sni` may be null;
-/// `mtu` 0 selects the default (1280). Returns an opaque handle, or null on
-/// invalid input.
+/// (a dup of the provider's utun fd). `auth_token`, `sni`, and
+/// `preferred_addresses` may be null; `mtu` 0 selects the default (1280).
+/// `preferred_addresses` is a comma-separated list of IP literals (e.g.
+/// `"10.99.0.2,2001:db8::2"`) preferred on a cold start, before any address is
+/// assigned, so the proxy can hand back a stable IP; the first entry of each
+/// family is used. Null, empty, or unparseable entries keep the previous "no
+/// preference" behavior. Returns an opaque handle, or null on invalid input.
 ///
 /// # Safety
-/// `proxy_url` must be a valid NUL-terminated UTF-8 string; `auth_token` and
-/// `sni` the same or null. `callbacks` pointers must remain valid until stop.
+/// `proxy_url` must be a valid NUL-terminated UTF-8 string; `auth_token`,
+/// `sni`, and `preferred_addresses` the same or null. `callbacks` pointers must
+/// remain valid until stop.
 #[no_mangle]
 pub unsafe extern "C" fn masque_client_ip_start(
     proxy_url: *const c_char,
     auth_token: *const c_char,
     sni: *const c_char,
+    preferred_addresses: *const c_char,
     insecure: bool,
     mtu: u16,
     tun_fd: RawFd,
@@ -191,6 +197,21 @@ pub unsafe extern "C" fn masque_client_ip_start(
     };
     let auth_token = cstr(auth_token);
     let sni = cstr(sni);
+    let preferred_addresses: Vec<IpAddr> = cstr(preferred_addresses)
+        .map(|s| {
+            s.split(',')
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .filter_map(|t| match t.parse::<IpAddr>() {
+                    Ok(ip) => Some(ip),
+                    Err(_) => {
+                        log::warn!("[client] ignoring invalid preferred address: {t}");
+                        None
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let stats = Arc::new(TunnelStats::default());
     let reconnect = Arc::new(tokio::sync::Notify::new());
     let shutdown = Arc::new(tokio::sync::Notify::new());
@@ -211,6 +232,7 @@ pub unsafe extern "C" fn masque_client_ip_start(
         stats: Some(stats.clone()),
         reconnect: Some(reconnect.clone()),
         shutdown: Some(shutdown.clone()),
+        preferred_addresses,
     };
 
     let thread = std::thread::spawn(move || {

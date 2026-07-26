@@ -45,6 +45,11 @@ typedef struct {
 //   proxy_url:  MASQUE proxy URL, e.g. "https://relay.example.com" (required)
 //   auth_token: Bearer token for proxy authorization (NULL = none)
 //   sni:        TLS SNI override for domain fronting (NULL = host of proxy_url)
+//   preferred_addresses: comma-separated preferred tunnel IPs to request on a
+//               cold start, before any address is assigned, e.g.
+//               "10.99.0.2,2001:db8::2" (NULL/empty/invalid = no preference).
+//               The first entry of each family is used. A held address, kept
+//               across reconnects, always takes precedence.
 //   insecure:   skip server certificate verification (self-signed servers)
 //   mtu:        TUN MTU; 0 selects the default (1280)
 //   tun_fd:     dup of the provider's utun fd; the client takes ownership
@@ -52,6 +57,7 @@ typedef struct {
 MasqueHandle *masque_client_ip_start(const char *proxy_url,
                                      const char *auth_token,
                                      const char *sni,
+                                     const char *preferred_addresses,
                                      bool insecure,
                                      uint16_t mtu,
                                      int32_t tun_fd,

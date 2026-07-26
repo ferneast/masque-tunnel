@@ -108,6 +108,14 @@ enum Commands {
         /// warning if the resolver is not routed through the tunnel.
         #[arg(long)]
         dns: Vec<std::net::IpAddr>,
+
+        /// Preferred tunnel address to request on a cold start, before any
+        /// address is assigned (e.g. 10.99.0.2). Repeatable to prefer one per
+        /// family; the first entry of each family is used. Omit for the default
+        /// all-zero "no preference" request. A held address (kept across
+        /// reconnects) always takes precedence over this hint.
+        #[arg(long)]
+        preferred_address: Vec<std::net::IpAddr>,
     },
 
     /// Run as MASQUE proxy server (CONNECT-UDP always; CONNECT-IP with --ip-pool)
@@ -203,6 +211,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             tun_name,
             redirect_gateway,
             dns,
+            preferred_address,
         } => {
             ip_client::run(ip_client::IpClientConfig {
                 proxy_url,
@@ -219,6 +228,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 stats: None,
                 reconnect: None,
                 shutdown: None,
+                preferred_addresses: preferred_address,
             })
             .await
         }

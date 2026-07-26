@@ -59,6 +59,15 @@ pub struct IpClientConfig {
     /// assigned address immediately instead of waiting out its idle timeout,
     /// then `run` returns. `None` on desktop, where SIGINT/SIGTERM stops it.
     pub shutdown: Option<std::sync::Arc<tokio::sync::Notify>>,
+    /// Operator-preferred tunnel addresses for the interactive ADDRESS_REQUEST
+    /// (RFC 9484 §4.7.2), used only while this client holds no address yet — the
+    /// cold start before any ADDRESS_ASSIGN, where there is nothing to prefer.
+    /// Empty (the default) keeps requesting the all-zero "no preference" address
+    /// on a fresh tunnel. Otherwise the first entry of each IP family (one IPv4,
+    /// one IPv6) seeds that family's request, so a proxy that honors preferences
+    /// can hand back a stable IP from the very first connect. Once an address is
+    /// assigned it is held on the TUN binding and always takes precedence.
+    pub preferred_addresses: Vec<IpAddr>,
 }
 
 /// Cumulative tunneled traffic since start: `tx` counts IP bytes sent to the
@@ -421,6 +430,22 @@ fn interleave_families(addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
     out
 }
 
+/// The address to request for one family in the interactive ADDRESS_REQUEST
+/// (RFC 9484 §4.7.2). Prefer the address already `held` on the TUN binding —
+/// present on reconnects, keeping the tunnel IP stable. When nothing is held
+/// yet (cold start), use the operator-configured `preferred` address if it
+/// belongs to this family, else the all-zero `unspecified` "no preference"
+/// sentinel (whose family also selects which family this call is resolving).
+fn request_address(held: Option<IpAddr>, preferred: Option<IpAddr>, unspecified: IpAddr) -> IpAddr {
+    if let Some(addr) = held {
+        return addr;
+    }
+    match preferred {
+        Some(p) if p.is_ipv4() == unspecified.is_ipv4() => p,
+        _ => unspecified,
+    }
+}
+
 /// One event handled by the forwarding loop, collected as an owned value so the
 /// borrows taken inside `select!` end before we touch `tun`.
 enum Event {
@@ -524,37 +549,42 @@ async fn run_tunnel(
     *established = true;
 
     // Interactive assignment (RFC 9484 §4.7.2): request one address per family.
-    // On a reconnect we ask for the addresses we already hold, so the proxy
-    // keeps this client's tunnel IP stable across reconnects. Stability avoids
-    // renumbering the TUN and, crucially, keeps the client's and proxy's view of
-    // the address in sync even if the resulting ADDRESS_ASSIGN is lost — nothing
-    // changed, so a lost capsule is harmless. The first connect holds no address
-    // yet and expresses no preference (all-zero); a proxy that cannot honor the
-    // preference simply appends its own choice at Request ID 0, so an older proxy
-    // still assigns normally.
+    // The address currently held on the TUN binding is requested so the proxy
+    // keeps this client's tunnel IP stable across reconnects — avoiding a TUN
+    // renumber and keeping both views in sync even if an ADDRESS_ASSIGN is lost.
+    // On the cold start, before any assignment, nothing is held: fall back to the
+    // operator-configured preferred address (if any, and of the right family) so
+    // a fresh tunnel can still request a stable IP; otherwise send the all-zero
+    // "no preference" sentinel, which an older proxy simply answers with its own
+    // choice at Request ID 0. A held address always wins over the configured hint.
     let held_v4 = tun
         .as_ref()
-        .and_then(|b| b.addrs.iter().find(|(a, _)| a.is_ipv4()).map(|(a, _)| *a))
-        .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        .and_then(|b| b.addrs.iter().find(|(a, _)| a.is_ipv4()).map(|(a, _)| *a));
     let held_v6 = tun
         .as_ref()
-        .and_then(|b| b.addrs.iter().find(|(a, _)| a.is_ipv6()).map(|(a, _)| *a))
-        .unwrap_or(IpAddr::V6(Ipv6Addr::UNSPECIFIED));
+        .and_then(|b| b.addrs.iter().find(|(a, _)| a.is_ipv6()).map(|(a, _)| *a));
+    // The configured list may carry both families; each request slot takes the
+    // first entry of its own family (extra same-family entries are ignored — the
+    // request has one slot per family).
+    let pref_v4 = config.preferred_addresses.iter().copied().find(|a| a.is_ipv4());
+    let pref_v6 = config.preferred_addresses.iter().copied().find(|a| a.is_ipv6());
+    let req_v4 = request_address(held_v4, pref_v4, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    let req_v6 = request_address(held_v6, pref_v6, IpAddr::V6(Ipv6Addr::UNSPECIFIED));
     stream
         .send_data(encode_address_request(&[
             RequestedAddress {
                 request_id: 1,
-                addr: held_v4,
+                addr: req_v4,
                 prefix_len: 32,
             },
             RequestedAddress {
                 request_id: 2,
-                addr: held_v6,
+                addr: req_v6,
                 prefix_len: 128,
             },
         ]))
         .await?;
-    log::debug!("[client] sent ADDRESS_REQUEST (v4={held_v4}, v6={held_v6})");
+    log::debug!("[client] sent ADDRESS_REQUEST (v4={req_v4}, v6={req_v6})");
 
     let mut parser = CapsuleParser::default();
     let mut pkt_buf = vec![0u8; config.mtu.max(1280) as usize + 64];
@@ -929,5 +959,49 @@ mod tests {
     fn interleave_single_family_is_unchanged() {
         let addrs = vec![sa("10.0.0.1:443"), sa("10.0.0.2:443")];
         assert_eq!(interleave_families(addrs.clone()), addrs);
+    }
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn request_prefers_held_over_configured() {
+        // A held address (reconnect) must win, so the tunnel IP stays stable.
+        assert_eq!(
+            request_address(Some(ip("10.0.0.5")), Some(ip("10.0.0.9")), IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+            ip("10.0.0.5")
+        );
+    }
+
+    #[test]
+    fn request_uses_configured_when_nothing_held() {
+        // Cold start: no held address, so the configured preference is requested.
+        assert_eq!(
+            request_address(None, Some(ip("10.0.0.9")), IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+            ip("10.0.0.9")
+        );
+    }
+
+    #[test]
+    fn request_ignores_preference_of_other_family() {
+        // A preference only fills its own family's slot.
+        assert_eq!(
+            request_address(None, Some(ip("2001:db8::2")), IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+        );
+        assert_eq!(
+            request_address(None, Some(ip("10.0.0.9")), IpAddr::V6(Ipv6Addr::UNSPECIFIED)),
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+        );
+    }
+
+    #[test]
+    fn request_defaults_to_unspecified_without_preference() {
+        // Empty config keeps the previous all-zero "no preference" request.
+        assert_eq!(
+            request_address(None, None, IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+        );
     }
 }
