@@ -17,6 +17,15 @@ pub const CONNECT_IP_PATH: &str = "/.well-known/masque/ip";
 /// the IPv6 minimum MTU of 1280.
 pub const TUNNEL_IP_MTU: u32 = 1300;
 
+/// Strip the brackets `Url::host_str` keeps around an IPv6 literal. They belong
+/// in a URI authority but break both name resolution and TLS, which expect the
+/// bare address.
+pub fn unbracket_host(host: &str) -> &str {
+    host.strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(host)
+}
+
 /// Append a QUIC variable-length integer (RFC 9000, Section 16) to a buffer.
 pub fn put_varint(buf: &mut BytesMut, value: u64) {
     if value < 64 {
@@ -252,6 +261,23 @@ mod tests {
 
     fn p(path: &str) -> Option<(String, u16)> {
         parse_connect_udp_path(path)
+    }
+
+    #[test]
+    fn unbracket_host_handles_every_host_form() {
+        // What `Url::host_str` hands back for an IPv6 literal proxy URL. The
+        // bracketed form reaches getaddrinfo as a hostname and fails there.
+        let host = url::Url::parse("https://[2001:db8::1]:443")
+            .unwrap()
+            .host_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(host, "[2001:db8::1]");
+        assert_eq!(unbracket_host(&host), "2001:db8::1");
+        assert!(unbracket_host(&host).parse::<std::net::Ipv6Addr>().is_ok());
+
+        assert_eq!(unbracket_host("example.com"), "example.com");
+        assert_eq!(unbracket_host("192.0.2.6"), "192.0.2.6");
     }
 
     #[test]

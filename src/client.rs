@@ -26,7 +26,9 @@ pub async fn run(config: ClientConfig) -> Result<(), Box<dyn std::error::Error +
     let url = url::Url::parse(&config.proxy_url)?;
     let proxy_host = url.host_str().ok_or("missing host in proxy URL")?.to_string();
     let proxy_port = url.port().unwrap_or(443);
-    let sni = config.sni.unwrap_or_else(|| proxy_host.clone());
+    let sni = config
+        .sni
+        .unwrap_or_else(|| unbracket_host(&proxy_host).to_string());
 
     // Parse target
     let (target_host, target_port) = parse_target(&config.target)?;

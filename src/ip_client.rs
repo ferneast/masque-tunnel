@@ -175,7 +175,10 @@ pub async fn run(config: IpClientConfig) -> Result<(), Box<dyn std::error::Error
     let url = url::Url::parse(&config.proxy_url)?;
     let proxy_host = url.host_str().ok_or("missing host in proxy URL")?.to_string();
     let proxy_port = url.port().unwrap_or(443);
-    let sni = config.sni.clone().unwrap_or_else(|| proxy_host.clone());
+    let sni = config
+        .sni
+        .clone()
+        .unwrap_or_else(|| unbracket_host(&proxy_host).to_string());
 
     log::info!(
         "[client] CONNECT-IP mode, proxy={proxy_host}:{proxy_port} mtu={}",
@@ -474,7 +477,7 @@ async fn run_tunnel(
     dns: &mut crate::dns::DnsGuard,
     established: &mut bool,
 ) -> Result<TunnelExit, Box<dyn std::error::Error + Send + Sync>> {
-    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((proxy_host, proxy_port))
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((unbracket_host(proxy_host), proxy_port))
         .await?
         .collect();
     if addrs.is_empty() {
