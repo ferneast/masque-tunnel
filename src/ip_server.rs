@@ -4,7 +4,8 @@
 //! assigned a /32 from a configured IPv4 pool and/or a /128 from an IPv6
 //! pool (dual-stack); downstream packets read from the TUN are routed to
 //! sessions by destination address and sent as QUIC DATAGRAMs on the owning
-//! connection, upstream packets are source-validated and written to the TUN.
+//! connection, upstream packets are source-validated, destination-filtered
+//! (see `DstPolicy`), and written to the TUN.
 //! Capsules travel on the request stream body; IP packets travel in HTTP
 //! Datagrams with an RFC 9484 context ID of 0. Forwarding between the TUN
 //! and the internet is the kernel's job (IP forwarding + NAT), which also
@@ -53,6 +54,11 @@ pub struct IpConfig {
     /// DNS resolver addresses to advertise via a DNS_ASSIGN capsule
     /// (draft-ietf-masque-connect-ip-dns). Empty means no DNS_ASSIGN is sent.
     pub advertised_dns: Vec<IpAddr>,
+    /// Permit upstream packets to private destinations (RFC 1918, CGN
+    /// 100.64.0.0/10, ULA fc00::/7) behind the server, e.g. for LAN access.
+    /// Loopback, link-local (cloud metadata), multicast, and broadcast
+    /// destinations are dropped regardless (see `DstPolicy`).
+    pub allow_private: bool,
 }
 
 /// Allocates client host addresses from a v4 or v6 pool, skipping the
@@ -176,6 +182,8 @@ pub struct IpTunState {
     advertised_routes: Vec<(IpAddr, u8)>,
     /// DNS resolvers advertised via DNS_ASSIGN. Empty = no DNS_ASSIGN sent.
     advertised_dns: Vec<IpAddr>,
+    /// Upstream destination policy, shared by every session.
+    dst_policy: Arc<DstPolicy>,
 }
 
 impl IpTunState {
@@ -336,6 +344,21 @@ fn cidr_to_range(net: IpAddr, prefix: u8) -> IpAddressRange {
     }
 }
 
+/// True if `ip` falls within `net/prefix` (same family; host bits ignored).
+fn cidr_contains(net: IpAddr, prefix: u8, ip: IpAddr) -> bool {
+    match (net, ip) {
+        (IpAddr::V4(n), IpAddr::V4(a)) => {
+            let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+            (u32::from(a) & mask) == (u32::from(n) & mask)
+        }
+        (IpAddr::V6(n), IpAddr::V6(a)) => {
+            let mask = if prefix == 0 { 0 } else { u128::MAX << (128 - prefix) };
+            (u128::from(a) & mask) == (u128::from(n) & mask)
+        }
+        _ => false,
+    }
+}
+
 /// Build the ROUTE_ADVERTISEMENT range set for a session (RFC 9484 §4.7.3:
 /// each advertisement carries the complete route set, ordered ascending with
 /// IPv4 before IPv6). With no configured routes this advertises a full tunnel
@@ -409,6 +432,67 @@ fn packet_dst(pkt: &[u8]) -> Option<IpAddr> {
     }
 }
 
+/// Upstream destination policy (the "local policy checks" of RFC 9484 §7.2):
+/// sensitive destinations a tunneled client must never reach via the server.
+///
+/// Loopback, link-local (which covers the cloud metadata service at
+/// 169.254.169.254), multicast, broadcast, and unspecified destinations are
+/// always dropped. Private ranges (RFC 1918, CGN 100.64.0.0/10, ULA fc00::/7)
+/// are dropped by default so clients cannot wander into the server's VPC/LAN
+/// through NAT; `allow_private` opens them up deliberately. The tunnel's own
+/// pools and advertised DNS resolvers are exempt from the private block so
+/// tunnel-internal traffic keeps flowing.
+struct DstPolicy {
+    /// The configured address pools: tunnel-internal destinations (the server
+    /// gateway and other clients) stay reachable even in private space.
+    pools: Vec<(IpAddr, u8)>,
+    /// Advertised DNS resolvers, reachable even when private.
+    dns: Vec<IpAddr>,
+    /// Permit private/CGN/ULA destinations (LAN behind the server).
+    allow_private: bool,
+}
+
+impl DstPolicy {
+    /// True if an upstream packet to `dst` must be dropped.
+    fn blocked(&self, dst: IpAddr) -> bool {
+        // Never forwarded, regardless of configuration.
+        let hard = match dst {
+            IpAddr::V4(v4) => {
+                v4.is_unspecified()
+                    || v4.is_loopback()
+                    || v4.is_link_local() // includes AWS/GCP/aliyun metadata at 169.254.169.254
+                    || v4.is_multicast()
+                    || v4.is_broadcast()
+                    || v4.octets()[0] == 0 // "this network" 0.0.0.0/8
+                    || v4 == Ipv4Addr::new(100, 100, 100, 200) // Alibaba Cloud metadata
+            }
+            IpAddr::V6(v6) => {
+                v6.is_unspecified()
+                    || v6.is_loopback()
+                    || v6.is_multicast()
+                    || (v6.segments()[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
+                    || v6.to_ipv4_mapped().is_some()
+            }
+        };
+        if hard {
+            return true;
+        }
+        if self.allow_private
+            || self.pools.iter().any(|&(n, p)| cidr_contains(n, p, dst))
+            || self.dns.contains(&dst)
+        {
+            return false;
+        }
+        match dst {
+            IpAddr::V4(v4) => {
+                let o = v4.octets();
+                v4.is_private() || (o[0] == 100 && o[1] & 0xc0 == 64) // CGN 100.64.0.0/10
+            }
+            IpAddr::V6(v6) => v6.segments()[0] & 0xfe00 == 0xfc00, // ULA fc00::/7
+        }
+    }
+}
+
 /// Create the TUN device and spawn the downstream (TUN -> clients) router.
 pub fn init(config: &IpConfig) -> Result<Arc<IpTunState>, Box<dyn std::error::Error + Send + Sync>> {
     let v4 = config
@@ -465,7 +549,15 @@ pub fn init(config: &IpConfig) -> Result<Arc<IpTunState>, Box<dyn std::error::Er
         routes: RwLock::new(HashMap::new()),
         advertised_routes: config.advertised_routes.clone(),
         advertised_dns: config.advertised_dns.clone(),
+        dst_policy: Arc::new(DstPolicy {
+            pools: v4.iter().chain(v6.iter()).copied().collect(),
+            dns: config.advertised_dns.clone(),
+            allow_private: config.allow_private,
+        }),
     });
+    if config.allow_private {
+        log::info!("[server] CONNECT-IP private destinations (RFC 1918/CGN/ULA) are allowed");
+    }
     if !state.advertised_routes.is_empty() {
         log::info!(
             "[server] CONNECT-IP advertising {} configured route(s) (split tunnel)",
@@ -579,12 +671,15 @@ impl Drop for IpSessionGuard {
 pub struct IpSession {
     tun: Arc<AsyncDevice>,
     assigned: SharedAssigned,
+    policy: Arc<DstPolicy>,
     capsule: tokio::task::AbortHandle,
 }
 
 impl IpSession {
-    /// Upstream: HTTP Datagram payload -> TUN, with anti-spoofing source
-    /// validation. Context IDs other than 0 are reserved and dropped.
+    /// Upstream: HTTP Datagram payload -> TUN. Drops packets whose source is
+    /// outside the session's assigned addresses (anti-spoofing, RFC 9484
+    /// §11 / BCP 38) or whose destination the policy blocks (see `DstPolicy`).
+    /// Context IDs other than 0 are reserved and dropped.
     pub fn forward_upstream(&self, context_id: u64, pkt: &[u8]) {
         if context_id != 0 {
             return;
@@ -593,11 +688,17 @@ impl IpSession {
             Some(src) => self.assigned.lock().unwrap().contains(&src),
             None => false,
         };
-        if source_ok {
-            // try_send: never block; a full TUN queue drops, which IP tolerates.
-            let _ = self.tun.try_send(pkt);
-        } else {
+        if !source_ok {
             log::trace!("[server] drop packet with invalid source");
+            return;
+        }
+        match packet_dst(pkt) {
+            Some(dst) if !self.policy.blocked(dst) => {
+                // try_send: never block; a full TUN queue drops, which IP tolerates.
+                let _ = self.tun.try_send(pkt);
+            }
+            Some(dst) => log::trace!("[server] drop packet to blocked destination {dst}"),
+            None => {}
         }
     }
 }
@@ -803,6 +904,7 @@ pub async fn handle_ip_request(
         IpSession {
             tun: state.tun.clone(),
             assigned,
+            policy: state.dst_policy.clone(),
             capsule: handle.abort_handle(),
         },
     ))
@@ -1115,6 +1217,62 @@ mod tests {
     fn is_full_v4(r: &IpAddressRange) -> bool {
         r.start == "0.0.0.0".parse::<IpAddr>().unwrap()
             && r.end == "255.255.255.255".parse::<IpAddr>().unwrap()
+    }
+
+    fn test_policy(allow_private: bool) -> DstPolicy {
+        DstPolicy {
+            pools: vec![
+                ("10.99.0.0".parse().unwrap(), 24),
+                ("fd00:6d61:7371::".parse().unwrap(), 64),
+            ],
+            dns: vec!["192.168.1.53".parse().unwrap()],
+            allow_private,
+        }
+    }
+
+    #[test]
+    fn dst_policy_hard_blocks_survive_allow_private() {
+        let p = test_policy(true);
+        for dst in [
+            "0.0.0.0",
+            "0.1.2.3",
+            "127.0.0.1",
+            "169.254.169.254", // AWS/GCP/aliyun metadata
+            "100.100.100.200", // Alibaba Cloud metadata
+            "224.0.0.251",
+            "255.255.255.255",
+            "::",
+            "::1",
+            "fe80::1",
+            "ff02::fb",
+            "::ffff:1.1.1.1",
+        ] {
+            assert!(p.blocked(dst.parse().unwrap()), "{dst} must be hard-blocked");
+        }
+    }
+
+    #[test]
+    fn dst_policy_private_toggle() {
+        let deny = test_policy(false);
+        let allow = test_policy(true);
+        for dst in ["10.1.2.3", "172.16.0.1", "192.168.0.1", "100.64.0.1", "fd12::1"] {
+            let ip: IpAddr = dst.parse().unwrap();
+            assert!(deny.blocked(ip), "{dst} is private, blocked by default");
+            assert!(!allow.blocked(ip), "{dst} passes with allow_private");
+        }
+        for dst in ["1.1.1.1", "2606:4700:4700::1111"] {
+            assert!(!deny.blocked(dst.parse().unwrap()), "{dst} is public");
+        }
+    }
+
+    #[test]
+    fn dst_policy_tunnel_internal_exempt_from_private_block() {
+        let p = test_policy(false);
+        assert!(!p.blocked("10.99.0.1".parse().unwrap())); // server gateway
+        assert!(!p.blocked("10.99.0.7".parse().unwrap())); // another client
+        assert!(!p.blocked("fd00:6d61:7371::2".parse().unwrap()));
+        assert!(!p.blocked("192.168.1.53".parse().unwrap())); // advertised DNS
+        assert!(p.blocked("10.99.1.1".parse().unwrap())); // outside the /24 pool
     }
 
     #[test]

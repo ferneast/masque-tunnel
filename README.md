@@ -121,6 +121,7 @@ Server verification defaults to the system/Mozilla CA bundle, so a public ACME (
 | `--ip-tun-name` | | Name for the CONNECT-IP TUN device | auto |
 | `--ip-routes-file` | | File of routes to advertise (one CIDR per line) — split tunnel | full tunnel |
 | `--dns-assign` | | DNS resolver(s) to advertise to clients (repeatable) | none |
+| `--ip-allow-private` | | Let clients reach private ranges (RFC 1918/CGN/ULA) behind the server | blocked |
 
 CONNECT-UDP is always served. CONNECT-IP is enabled only when `--ip-pool` and/or `--ip6-pool` is given; without a pool, `connect-ip` requests are rejected.
 
@@ -143,7 +144,13 @@ By default the server advertises a full tunnel (`0.0.0.0/0` and/or `::/0`). To r
 
 The server sends these as the RFC 9484 ROUTE_ADVERTISEMENT (each advertisement is the complete set, per §4.7.3). The client installs exactly these prefixes as direct routes via the TUN and leaves the host's default route untouched — so a split tunnel needs no `--redirect-gateway`. The file is read once at startup; a route with no matching assigned address family is skipped.
 
-## Deployment
+### Destination filtering
+
+Besides source validation (a packet whose source is not the session's assigned address is dropped — RFC 9484 §11 / BCP 38), the server filters upstream packets by destination before they reach the TUN:
+
+- **Always dropped**: loopback, link-local (`169.254.0.0/16` incl. the cloud metadata service `169.254.169.254`, `fe80::/10`), the Alibaba Cloud metadata address `100.100.100.200`, multicast, broadcast, unspecified, `0.0.0.0/8`, and IPv4-mapped IPv6.
+- **Dropped by default, opt-in via `--ip-allow-private`**: private ranges behind the server — RFC 1918 (`10/8`, `172.16/12`, `192.168/16`), CGN `100.64.0.0/10`, and IPv6 ULA `fc00::/7`. This keeps tunneled clients out of the server's VPC/LAN through NAT unless LAN access is intended.
+- **Always reachable**: the tunnel's own address pools (server gateway, other clients) and any `--dns-assign` resolvers, even when they sit in private space.
 
 ### TLS Certificate
 

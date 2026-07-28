@@ -30,6 +30,10 @@ pub struct ServerConfig {
     /// DNS resolver(s) to advertise to CONNECT-IP clients via a DNS_ASSIGN
     /// capsule (draft-ietf-masque-connect-ip-dns). Empty = no DNS_ASSIGN.
     pub dns_assign: Vec<std::net::IpAddr>,
+    /// Allow CONNECT-IP clients to reach private destinations (RFC 1918/CGN/
+    /// ULA) behind the server; loopback, link-local (cloud metadata), and
+    /// multicast stay blocked regardless.
+    pub ip_allow_private: bool,
 }
 
 /// Run the MASQUE CONNECT-UDP proxy server.
@@ -78,6 +82,7 @@ pub async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error +
             tun_name: config.ip_tun_name.clone(),
             advertised_routes,
             advertised_dns: config.dns_assign.clone(),
+            allow_private: config.ip_allow_private,
         })?)
     } else {
         None

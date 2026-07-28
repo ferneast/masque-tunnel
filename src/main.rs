@@ -164,6 +164,14 @@ enum Commands {
         /// without their own --dns adopt these automatically.
         #[arg(long)]
         dns_assign: Vec<std::net::IpAddr>,
+
+        /// Allow CONNECT-IP clients to reach private destinations behind the
+        /// server (RFC 1918, CGN 100.64.0.0/10, IPv6 ULA), e.g. for LAN
+        /// access. Loopback, link-local (cloud metadata), multicast, and
+        /// broadcast destinations are always dropped. The tunnel's own pool
+        /// and --dns-assign resolvers are always reachable.
+        #[arg(long)]
+        ip_allow_private: bool,
     },
 }
 
@@ -243,6 +251,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             ip_tun_name,
             ip_routes_file,
             dns_assign,
+            ip_allow_private,
         } => {
             server::run(server::ServerConfig {
                 listen,
@@ -255,6 +264,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 ip_tun_name,
                 ip_routes_file,
                 dns_assign,
+                ip_allow_private,
             })
             .await
         }
