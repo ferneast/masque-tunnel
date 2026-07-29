@@ -1,6 +1,93 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{BufMut, Bytes, BytesMut};
+
+/// Build the client TLS config both clients share.
+///
+/// Trust resolves in three steps: `--insecure` disables verification
+/// entirely, `--ca` pins a private root store, and the default is the Mozilla
+/// CA bundle — which includes the ISRG roots that real ACME/Let's Encrypt
+/// certificates chain to, so a public relay verifies with no extra flags and
+/// no platform trust glue (the iOS build has none available).
+///
+/// Shared rather than duplicated because both clients need byte-identical
+/// behavior here, and a trust decision that drifts between two copies is the
+/// kind of bug that fails open.
+pub fn build_client_tls_config(
+    ca: &Option<String>,
+    insecure: bool,
+) -> Result<rustls::ClientConfig, Box<dyn std::error::Error + Send + Sync>> {
+    let mut config = if insecure {
+        rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
+            .with_no_client_auth()
+    } else {
+        let mut roots = rustls::RootCertStore::empty();
+        match ca {
+            Some(path) => {
+                let file = std::fs::File::open(path)?;
+                let mut reader = std::io::BufReader::new(file);
+                for cert in rustls_pemfile::certs(&mut reader) {
+                    roots.add(cert?)?;
+                }
+            }
+            None => roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned()),
+        }
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth()
+    };
+    config.alpn_protocols = vec![b"h3".to_vec()];
+    // Allow 0-RTT on reconnect: the rustls session store persists tickets, so a
+    // resumed handshake sends its CONNECT request as early data and reaches the
+    // tunnel one RTT sooner. quinn falls back to 1-RTT if the server refuses.
+    config.enable_early_data = true;
+    Ok(config)
+}
+
+/// Accepts any certificate. Only reachable via `--insecure`, for self-signed
+/// test deployments.
+#[derive(Debug)]
+pub struct SkipServerVerification;
+
+impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
 
 /// Reconnect pacing, shared by both clients: the wait doubles after every
 /// attempt that did not run a session, up to a ceiling, and drops back to the
