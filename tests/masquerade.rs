@@ -308,3 +308,40 @@ async fn a_valid_token_still_establishes_a_tunnel() {
     assert_eq!(ok.status, 200);
     assert_eq!(ok.headers.get("capsule-protocol").unwrap(), "?1");
 }
+
+#[tokio::test]
+async fn the_bundled_example_site_serves_correctly() {
+    // examples/decoy-site is what production points --masquerade-dir at, so a
+    // broken file there is a broken decoy on every relay.
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/decoy-site");
+    let addr = spawn_server(Some(dir.into()), None, Some("nginx".into()), Some("s".into()));
+    settle().await;
+
+    let root = probe(addr, "GET", "/", None, None).await;
+    assert_eq!(root.status, 200);
+    assert_eq!(
+        root.headers.get("content-type").unwrap(),
+        "text/html; charset=utf-8"
+    );
+    assert!(root.body.starts_with(b"<!DOCTYPE html>"));
+
+    // Assets the page references must resolve, or a prober fetching them gets
+    // 404s that a real site would not produce.
+    for (path, ctype) in [
+        ("/style.css", "text/css; charset=utf-8"),
+        ("/favicon.svg", "image/svg+xml"),
+        ("/robots.txt", "text/plain; charset=utf-8"),
+        ("/status.json", "application/json"),
+    ] {
+        let r = probe(addr, "GET", path, None, None).await;
+        assert_eq!(r.status, 200, "{path} must resolve");
+        assert_eq!(r.headers.get("content-type").unwrap(), ctype, "{path}");
+        assert!(!r.body.is_empty(), "{path} must not be empty");
+    }
+
+    // And nothing in it may name the product.
+    let text = String::from_utf8_lossy(&root.body).to_ascii_lowercase();
+    for bad in ["masque", "tunnel", "vpn", "proxy"] {
+        assert!(!text.contains(bad), "example site leaked {bad:?}");
+    }
+}
