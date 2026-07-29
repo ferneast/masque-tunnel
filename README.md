@@ -16,7 +16,9 @@ MASQUE solves exactly this: CONNECT-UDP ([RFC 9298](https://datatracker.ietf.org
 - **CONNECT-IP ([RFC 9484](https://datatracker.ietf.org/doc/html/rfc9484))** — full-tunnel VPN over a TUN device, dual-stack (IPv4 + IPv6), with declarative address assignment and route advertisement capsules ([RFC 9297](https://datatracker.ietf.org/doc/html/rfc9297))
 - **Client + Server** — single binary with `client` / `client-ip` / `server` subcommands
 - **Obfuscation** — traffic appears as standard HTTPS/QUIC on port 443
-- **Authentication** — optional Bearer token for client verification
+- **Decoy site** — anything that is not an authenticated tunnel session is answered as an ordinary web server would, so an active probe sees a website rather than a proxy ([details](#decoy-site---masquerade-dir----masquerade-url))
+- **Handshake that outgrows the first datagram** — the PQ key share pushes the ClientHello past one QUIC Initial, so the SNI is not in the datagram the GFW's QUIC filter inspects ([details](#sni-placement-in-the-handshake))
+- **Authentication** — optional Bearer token for client verification, compared in constant time
 - **Full-tunnel client extras** — `--redirect-gateway` to take over the default route, `--dns` to set system resolvers (both reverted on exit)
 - **Happy Eyeballs ([RFC 8305](https://datatracker.ietf.org/doc/html/rfc8305))** — dual-stack clients race IPv4/IPv6 handshakes so a dead family never wedges connect
 - **RFC-correct hop handling** — ICMP Packet Too Big on oversized packets and hop-count decrement on encapsulation ([RFC 9484 §7.1](https://datatracker.ietf.org/doc/html/rfc9484#section-7.1))
@@ -122,8 +124,33 @@ Server verification defaults to the system/Mozilla CA bundle, so a public ACME (
 | `--ip-routes-file` | | File of routes to advertise (one CIDR per line) — split tunnel | full tunnel |
 | `--dns-assign` | | DNS resolver(s) to advertise to clients (repeatable) | none |
 | `--ip-allow-private` | | Let clients reach private ranges (RFC 1918/CGN/ULA) behind the server | blocked |
+| `--masquerade-dir` | | Serve this directory to non-tunnel requests | built-in page |
+| `--masquerade-url` | | Redirect (302) non-tunnel requests here instead | off |
+| `--server-header` | | Value for the `Server` response header, e.g. `nginx` | none sent |
 
 CONNECT-UDP is always served. CONNECT-IP is enabled only when `--ip-pool` and/or `--ip6-pool` is given; without a pool, `connect-ip` requests are rejected.
+
+### Decoy site (`--masquerade-dir` / `--masquerade-url`)
+
+Every request that does not become an authenticated tunnel session is answered as an ordinary web server would. This matters because a proxy that replies `405 Method Not Allowed` to a plain `GET /`, or `407 Proxy Authentication Required` to a wrong token, has identified itself to anyone who asks — and an IP blocklisting, unlike SNI-based filtering, does not expire. The same reasoning drives Trojan's nginx fallback, Hysteria 2's `masquerade:` block, and VLESS+REALITY.
+
+Three modes:
+
+- **`--masquerade-dir <path>`** — serve files from a directory, `index.html` for directory paths. Path traversal is refused in every encoding, and files over 8 MB are treated as absent.
+- **`--masquerade-url <url>`** — answer everything with a `302` to an absolute URL.
+- **neither** — a built-in placeholder page at `/` and a `404` elsewhere.
+
+Two properties are load-bearing and covered by `tests/masquerade.rs`: a rejected tunnel request and a plain fetch of the same path produce **byte-identical** responses, and no response names this product. Set `--server-header` to whatever the decoy content should look like it is being served by; it is applied to tunnel responses too, so the two cannot be told apart by it.
+
+The tradeoff for operators: a wrong `--auth-token` no longer produces a distinct error. The client reports the status it got and lists the possible causes, but the server cannot say "bad token" without also saying it to a prober. Server logs still record `Auth failed, serving decoy`.
+
+### SNI placement in the handshake
+
+A QUIC Initial packet is encrypted with keys derived from the destination connection ID and a fixed, published salt, so any observer on the path can decrypt it and read the SNI. The GFW has done exactly this at national scale since August 2024 ([USENIX Security 2025](https://gfw.report/publications/usenixsecurity25/en/)); a match drops every packet of the `(src IP, dst IP, dst port)` triple for 180 seconds, which presents as "the tunnel died and came back a few minutes later".
+
+That filter inspects only the **first datagram** of a flow and does not reassemble a ClientHello spread across several. This build enables rustls's `prefer-post-quantum`, which offers `X25519MLKEM768` first; its ~1216-byte key share pushes the ClientHello over the ~1200-byte Initial budget, so the handshake occupies two datagrams and the SNI is not in the one being read. `tests/initial_flight.rs` asserts the spill, and fails if a dependency change quietly shrinks the ClientHello again.
+
+Two caveats worth being clear about. This exploits an implementation shortcut, not a protocol property — it holds until the filter learns to reassemble. And the GFW's QUIC list is a *blocklist*: a domain that was never listed was never being filtered on SNI, so this is insurance against your domain being added, not necessarily a fix for a connection failing today. It also costs ~1.2 KB per handshake, and does nothing about an IP-level block.
 
 ### DNS assignment (`--dns-assign`)
 

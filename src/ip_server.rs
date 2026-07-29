@@ -796,6 +796,7 @@ pub async fn handle_ip_request(
     mut stream: H3RequestStream,
     conn: &quinn::Connection,
     cleanup_tx: &mpsc::Sender<u64>,
+    server_header: Option<&str>,
 ) -> Option<(u64, IpSession)> {
     let Some((target, ipproto)) = parse_connect_ip_path(path) else {
         log::info!("[server] Invalid CONNECT-IP path: {path}");
@@ -832,12 +833,13 @@ pub async fn handle_ip_request(
     // rejected with 503 before the 200), but announced from the capsule loop
     // in response to the client's ADDRESS_REQUEST, followed by routes and DNS
     // (RFC 9484 §4.7.1/§4.7.3).
-    let resp = http::Response::builder()
+    let mut builder = http::Response::builder()
         .status(200)
-        .header("capsule-protocol", "?1")
-        .header("server", IDENT)
-        .body(())
-        .unwrap();
+        .header("capsule-protocol", "?1");
+    if let Some(value) = server_header {
+        builder = builder.header("server", value);
+    }
+    let resp = builder.body(()).unwrap();
     if let Err(e) = stream.send_response(resp).await {
         log::error!("[server] Failed to send CONNECT-IP 200: {e}");
         for ip in &assigned_ips {

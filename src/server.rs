@@ -9,6 +9,7 @@ use tokio::sync::mpsc;
 
 use crate::common::*;
 use crate::ip_server::{self, IpSession, IpTunState};
+use crate::masquerade::{H3Stream, Masquerade};
 
 /// Server configuration parsed from CLI arguments.
 pub struct ServerConfig {
@@ -34,11 +35,34 @@ pub struct ServerConfig {
     /// ULA) behind the server; loopback, link-local (cloud metadata), and
     /// multicast stay blocked regardless.
     pub ip_allow_private: bool,
+    /// Directory of files to serve to non-tunnel requests. Mutually exclusive
+    /// with `masquerade_url`; both absent serves a built-in placeholder page.
+    pub masquerade_dir: Option<String>,
+    /// Absolute URL to redirect non-tunnel requests to. Mutually exclusive
+    /// with `masquerade_dir`.
+    pub masquerade_url: Option<String>,
+    /// Value for the `Server` response header. None sends none.
+    pub server_header: Option<String>,
+}
+
+/// Immutable per-server state, shared by every connection task.
+struct ServerState {
+    auth_token: Option<String>,
+    /// Answers everything that does not become a tunnel session.
+    masquerade: Masquerade,
+    /// `Server` header value, applied to tunnel and decoy responses alike so
+    /// that neither can be told from the other by it. None sends no header.
+    server_header: Option<String>,
+    ip: Option<Arc<IpTunState>>,
 }
 
 /// Run the MASQUE CONNECT-UDP proxy server.
 pub async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listen_addr: SocketAddr = config.listen.parse()?;
+
+    // Validated before anything is bound, so a bad decoy path fails at startup
+    // rather than on the first probe.
+    let masquerade = Masquerade::from_options(config.masquerade_dir, config.masquerade_url)?;
 
     let certs = load_certs(&config.cert)?;
     let key = load_key(&config.key)?;
@@ -88,10 +112,15 @@ pub async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error +
         None
     };
 
-    let auth_token = config.auth_token;
+    let state = Arc::new(ServerState {
+        auth_token: config.auth_token,
+        masquerade,
+        server_header: config.server_header,
+        ip: ip_state,
+    });
+
     while let Some(incoming) = endpoint.accept().await {
-        let auth_token = auth_token.clone();
-        let ip_state = ip_state.clone();
+        let state = state.clone();
         tokio::spawn(async move {
             let conn = match incoming.accept() {
                 Ok(c) => match c.await {
@@ -107,7 +136,7 @@ pub async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error +
                 }
             };
             log::info!("[server] Connection from {}", conn.remote_address());
-            if let Err(e) = handle_connection(conn, auth_token, ip_state).await {
+            if let Err(e) = handle_connection(conn, state).await {
                 log::error!("[server] Connection error: {e}");
             }
             log::info!("[server] Connection closed");
@@ -119,8 +148,12 @@ pub async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error +
 
 /// Per-session state, keyed by the raw QUIC stream ID of its request. One
 /// QUIC connection can multiplex CONNECT-UDP and CONNECT-IP sessions.
+///
+/// `UdpSession` is boxed because it is 448 bytes to `IpSession`'s 32 — almost
+/// all of it the held `RequestStream` — and an unboxed enum would pay the
+/// larger size for every entry of the session map, including CONNECT-IP ones.
 enum Session {
-    Udp(UdpSession),
+    Udp(Box<UdpSession>),
     Ip(IpSession),
 }
 
@@ -146,8 +179,7 @@ impl Drop for UdpSession {
 
 async fn handle_connection(
     quinn_conn: quinn::Connection,
-    auth_token: Option<String>,
-    ip_state: Option<Arc<IpTunState>>,
+    state: Arc<ServerState>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Clone for datagram I/O — h3-quinn takes ownership of one clone for H3 stream processing
     let dgram_conn = quinn_conn.clone();
@@ -174,8 +206,8 @@ async fn handle_connection(
                         match resolver.resolve_request().await {
                             Ok((req, stream)) => {
                                 handle_request(
-                                    req, stream, &mut sessions, &auth_token,
-                                    &dgram_conn, &cleanup_tx, &ip_state,
+                                    req, stream, &mut sessions, &state,
+                                    &dgram_conn, &cleanup_tx,
                                 ).await;
                             }
                             Err(e) => log::error!("[server] Request resolve error: {e}"),
@@ -220,12 +252,11 @@ async fn handle_connection(
 
 async fn handle_request(
     req: http::Request<()>,
-    mut stream: h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    mut stream: H3Stream,
     sessions: &mut HashMap<u64, Session>,
-    auth_token: &Option<String>,
+    state: &ServerState,
     dgram_conn: &quinn::Connection,
     cleanup_tx: &mpsc::Sender<u64>,
-    ip_state: &Option<Arc<IpTunState>>,
 ) {
     let protocol = req
         .extensions()
@@ -235,35 +266,45 @@ async fn handle_request(
     let is_connect_udp = is_connect && protocol.as_deref() == Some("connect-udp");
     // connect-ip requests are only supported when a pool was configured.
     let is_connect_ip =
-        is_connect && protocol.as_deref() == Some("connect-ip") && ip_state.is_some();
+        is_connect && protocol.as_deref() == Some("connect-ip") && state.ip.is_some();
 
-    if !is_connect_udp && !is_connect_ip {
-        let resp = http::Response::builder().status(405).body(()).unwrap();
-        let _ = stream.send_response(resp).await;
-        return;
-    }
-
-    // Auth check (shared by both extended-CONNECT protocols)
-    if let Some(expected) = auth_token {
-        let expected_header = format!("Bearer {expected}");
-        let auth_ok = req
+    // Anything that does not become a tunnel session is answered by the decoy
+    // site. Crucially, "not an extended CONNECT" and "wrong token" take the
+    // same branch and produce byte-identical responses: an active prober that
+    // could tell them apart would have confirmed a proxy lives here, and an IP
+    // blocklisting — unlike SNI filtering — never expires.
+    let authorized = match &state.auth_token {
+        Some(expected) => req
             .headers()
             .get("proxy-authorization")
             .and_then(|v| v.to_str().ok())
-            == Some(&expected_header);
-        if !auth_ok {
-            log::warn!("[server] Auth failed");
-            let resp = http::Response::builder().status(407).body(()).unwrap();
-            let _ = stream.send_response(resp).await;
-            return;
+            .is_some_and(|got| ct_eq(got.as_bytes(), format!("Bearer {expected}").as_bytes())),
+        None => true,
+    };
+
+    if (!is_connect_udp && !is_connect_ip) || !authorized {
+        if is_connect && !authorized {
+            log::warn!("[server] Auth failed, serving decoy");
         }
+        state
+            .masquerade
+            .respond(&req, &mut stream, state.server_header.as_deref())
+            .await;
+        return;
     }
 
     if is_connect_ip {
         let path = req.uri().path().to_string();
-        let state = ip_state.as_ref().expect("checked above");
-        if let Some((stream_id, session)) =
-            ip_server::handle_ip_request(state, &path, stream, dgram_conn, cleanup_tx).await
+        let ip = state.ip.as_ref().expect("checked above");
+        if let Some((stream_id, session)) = ip_server::handle_ip_request(
+            ip,
+            &path,
+            stream,
+            dgram_conn,
+            cleanup_tx,
+            state.server_header.as_deref(),
+        )
+        .await
         {
             sessions.insert(stream_id, Session::Ip(session));
         }
@@ -329,12 +370,13 @@ async fn handle_request(
     }
 
     // Send 200 OK with capsule-protocol header (RFC 9297 §3.4)
-    let resp = http::Response::builder()
+    let mut builder = http::Response::builder()
         .status(200)
-        .header("capsule-protocol", "?1")
-        .header("server", IDENT)
-        .body(())
-        .unwrap();
+        .header("capsule-protocol", "?1");
+    if let Some(value) = &state.server_header {
+        builder = builder.header("server", value);
+    }
+    let resp = builder.body(()).unwrap();
     if let Err(e) = stream.send_response(resp).await {
         log::error!("[server] Failed to send 200: {e}");
         return;
@@ -389,12 +431,30 @@ async fn handle_request(
     // so it stays alive for the duration of the CONNECT-UDP session.
     sessions.insert(
         quic_stream_id,
-        Session::Udp(UdpSession {
+        Session::Udp(Box::new(UdpSession {
             target,
             _stream: stream,
             reader: handle.abort_handle(),
-        }),
+        })),
     );
+}
+
+/// Compare two byte strings without an early exit on the first mismatch.
+///
+/// The decoy makes probing cheap to attempt, so the token check should not
+/// leak its own answer through response timing: a plain `==` returns as soon
+/// as two bytes differ, which lets an attacker who can measure it recover the
+/// token one byte at a time. Length is still compared up front — it leaks far
+/// less than the contents, and the token is operator-chosen.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
+    }
+    std::hint::black_box(diff) == 0
 }
 
 fn load_certs(
@@ -413,3 +473,5 @@ fn load_key(
     let mut reader = std::io::BufReader::new(file);
     rustls_pemfile::private_key(&mut reader)?.ok_or_else(|| "no private key found in PEM file".into())
 }
+
+

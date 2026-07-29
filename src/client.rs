@@ -76,8 +76,11 @@ pub async fn run(config: ClientConfig) -> Result<(), Box<dyn std::error::Error +
     );
 
     // Reconnection loop
-    let mut backoff_ms = 500u64;
+    let mut backoff = Backoff::new();
     loop {
+        // Set by run_tunnel once the CONNECT-UDP session is actually running.
+        let mut established = false;
+
         log::info!("[client] Connecting to {proxy_addr}...");
         let quinn_conn = match endpoint.connect(proxy_addr, &sni) {
             Ok(connecting) => {
@@ -89,19 +92,16 @@ pub async fn run(config: ClientConfig) -> Result<(), Box<dyn std::error::Error +
                             zero_rtt_accepted.await;
                             log::info!("[client] 0-RTT accepted by server");
                         });
-                        backoff_ms = 500;
                         conn
                     }
                     Err(connecting) => match connecting.await {
                         Ok(c) => {
                             log::info!("[client] QUIC connected (full handshake)");
-                            backoff_ms = 500;
                             c
                         }
                         Err(e) => {
                             log::error!("[client] Connection failed: {e}");
-                            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                            backoff_ms = (backoff_ms * 2).min(30_000);
+                            tokio::time::sleep(backoff.next(false)).await;
                             continue;
                         }
                     },
@@ -109,8 +109,7 @@ pub async fn run(config: ClientConfig) -> Result<(), Box<dyn std::error::Error +
             }
             Err(e) => {
                 log::error!("[client] Connect error: {e}");
-                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                backoff_ms = (backoff_ms * 2).min(30_000);
+                tokio::time::sleep(backoff.next(false)).await;
                 continue;
             }
         };
@@ -122,12 +121,16 @@ pub async fn run(config: ClientConfig) -> Result<(), Box<dyn std::error::Error +
             &target_host,
             target_port,
             &config.auth_token,
+            &mut established,
         )
         .await;
 
-        log::warn!("[client] Connection lost: {err}, reconnecting in {backoff_ms}ms");
-        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-        backoff_ms = (backoff_ms * 2).min(30_000);
+        let wait = backoff.next(established);
+        log::warn!(
+            "[client] Connection lost: {err}, reconnecting in {}ms",
+            wait.as_millis()
+        );
+        tokio::time::sleep(wait).await;
     }
 }
 
@@ -138,8 +141,18 @@ async fn run_tunnel(
     target_host: &str,
     target_port: u16,
     auth_token: &Option<String>,
+    established: &mut bool,
 ) -> Box<dyn std::error::Error + Send + Sync> {
-    match run_tunnel_inner(quinn_conn, local, proxy_host, target_host, target_port, auth_token).await
+    match run_tunnel_inner(
+        quinn_conn,
+        local,
+        proxy_host,
+        target_host,
+        target_port,
+        auth_token,
+        established,
+    )
+    .await
     {
         Ok(()) => "tunnel ended".into(),
         Err(e) => e,
@@ -153,6 +166,9 @@ async fn run_tunnel_inner(
     target_host: &str,
     target_port: u16,
     auth_token: &Option<String>,
+    // Set once the proxy has accepted the session, so the caller can tell a
+    // healthy connection that dropped from one that never worked at all.
+    established: &mut bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Clone for datagram I/O — h3-quinn takes ownership of one clone
     let dgram_conn = quinn_conn.clone();
@@ -181,8 +197,7 @@ async fn run_tunnel_inner(
     let mut req_builder = http::Request::builder()
         .method("CONNECT")
         .uri(uri)
-        .header("capsule-protocol", "?1")
-        .header("user-agent", IDENT);
+        .header("capsule-protocol", "?1");
     if let Some(token) = auth_token {
         req_builder = req_builder.header("proxy-authorization", format!("Bearer {token}"));
     }
@@ -192,7 +207,16 @@ async fn run_tunnel_inner(
     let resp = stream.recv_response().await?;
 
     if resp.status() != http::StatusCode::OK {
-        return Err(format!("CONNECT-UDP rejected: status {}", resp.status()).into());
+        // The proxy answers every unauthenticated request from its decoy site,
+        // so a rejected session looks like an ordinary web response and cannot
+        // name the reason — that indistinguishability is the point. Spell out
+        // the candidates, or a 404 here reads as a wrong path and nothing else.
+        return Err(format!(
+            "CONNECT-UDP rejected: status {} (check --auth-token and --proxy-url; \
+             the proxy serves its decoy site to any request it does not accept)",
+            resp.status()
+        )
+        .into());
     }
     if let Some(server) = resp.headers().get("server").and_then(|v| v.to_str().ok()) {
         log::info!("[client] proxy server: {server}");
@@ -206,6 +230,9 @@ async fn run_tunnel_inner(
     log::info!(
         "[client] CONNECT-UDP established: h3_index={h3_index} quic_stream_id={quic_stream_id} target={target_host}:{target_port}"
     );
+    // The proxy accepted the session: this attempt genuinely connected, so the
+    // reconnect loop may restart its backoff from the floor.
+    *established = true;
 
     // Datagram forwarding loop
     let mut peer_addr: Option<SocketAddr> = None;
@@ -318,3 +345,4 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
             .supported_schemes()
     }
 }
+
