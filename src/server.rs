@@ -148,8 +148,12 @@ pub async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error +
 
 /// Per-session state, keyed by the raw QUIC stream ID of its request. One
 /// QUIC connection can multiplex CONNECT-UDP and CONNECT-IP sessions.
+///
+/// `UdpSession` is boxed because it is 448 bytes to `IpSession`'s 32 — almost
+/// all of it the held `RequestStream` — and an unboxed enum would pay the
+/// larger size for every entry of the session map, including CONNECT-IP ones.
 enum Session {
-    Udp(UdpSession),
+    Udp(Box<UdpSession>),
     Ip(IpSession),
 }
 
@@ -427,11 +431,11 @@ async fn handle_request(
     // so it stays alive for the duration of the CONNECT-UDP session.
     sessions.insert(
         quic_stream_id,
-        Session::Udp(UdpSession {
+        Session::Udp(Box::new(UdpSession {
             target,
             _stream: stream,
             reader: handle.abort_handle(),
-        }),
+        })),
     );
 }
 
