@@ -1,0 +1,8 @@
+{
+  "status": "ok",
+  "components": {
+    "edge": "operational",
+    "api": "operational",
+    "storage": "operational"
+  }
+}
