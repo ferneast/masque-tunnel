@@ -134,36 +134,6 @@ pub async fn run(config: ClientConfig) -> Result<(), Box<dyn std::error::Error +
     }
 }
 
-/// Reconnect pacing: the wait doubles after every attempt that did not run a
-/// session, up to a ceiling, and drops back to the floor once one did.
-///
-/// The distinction is the whole point, and it is about the *session*, not the
-/// QUIC handshake. A proxy rejects a bad request — wrong token, wrong path,
-/// CONNECT-IP with no pool — only after the handshake has already succeeded,
-/// so pacing on the handshake makes a permanently broken config reconnect
-/// twice a second forever: useless load on the proxy, and a metronome-regular
-/// pattern that stands out to anyone watching the flow.
-struct Backoff(u64);
-
-impl Backoff {
-    const FLOOR_MS: u64 = 500;
-    const CEILING_MS: u64 = 30_000;
-
-    fn new() -> Self {
-        Self(Self::FLOOR_MS)
-    }
-
-    /// Wait before the next attempt, given whether the last one ran a session.
-    fn next(&mut self, established: bool) -> Duration {
-        if established {
-            self.0 = Self::FLOOR_MS;
-        }
-        let wait = self.0;
-        self.0 = (self.0 * 2).min(Self::CEILING_MS);
-        Duration::from_millis(wait)
-    }
-}
-
 async fn run_tunnel(
     quinn_conn: &quinn::Connection,
     local: &UdpSocket,
@@ -376,43 +346,3 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn waits(b: &mut Backoff, n: usize, established: bool) -> Vec<u64> {
-        (0..n)
-            .map(|_| b.next(established).as_millis() as u64)
-            .collect()
-    }
-
-    #[test]
-    fn backoff_doubles_up_to_the_ceiling_while_nothing_connects() {
-        let mut b = Backoff::new();
-        assert_eq!(
-            waits(&mut b, 8, false),
-            [500, 1000, 2000, 4000, 8000, 16000, 30000, 30000]
-        );
-    }
-
-    #[test]
-    fn a_session_that_ran_returns_the_wait_to_the_floor() {
-        let mut b = Backoff::new();
-        waits(&mut b, 5, false); // climb to 16s
-        assert_eq!(b.next(true).as_millis(), 500);
-    }
-
-    #[test]
-    fn a_rejected_session_never_pins_the_wait_at_the_floor() {
-        // The regression this guards. Resetting the backoff on a completed QUIC
-        // handshake — rather than on a session that actually ran — made a wrong
-        // --auth-token reconnect every 500ms indefinitely, because the proxy
-        // only rejects the request after the handshake succeeds.
-        let mut b = Backoff::new();
-        let observed = waits(&mut b, 6, false);
-        assert!(
-            observed.iter().skip(1).all(|&w| w > Backoff::FLOOR_MS),
-            "every wait after the first must have grown, got {observed:?}"
-        );
-    }
-}

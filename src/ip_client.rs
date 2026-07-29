@@ -193,12 +193,13 @@ pub async fn run(config: IpClientConfig) -> Result<(), Box<dyn std::error::Error
     let mut dns = crate::dns::DnsGuard::new(config.dns.clone());
 
     enum Step {
-        Reconnect,
+        /// Wait this long, then reconnect.
+        Reconnect(Duration),
         Signaled,
         Shutdown,
     }
     let reconnect = async {
-        let mut backoff_ms = 500u64;
+        let mut backoff = Backoff::new();
         loop {
             // Set by run_tunnel once CONNECT-IP is established, so a drop after a
             // healthy session restarts backoff from the floor instead of
@@ -215,14 +216,15 @@ pub async fn run(config: IpClientConfig) -> Result<(), Box<dyn std::error::Error
                     &config, &client_config, &proxy_host, proxy_port, &sni, &mut tun, &mut routes,
                     &mut dns, &mut established,
                 ) => {
-                    if established {
-                        backoff_ms = 500;
-                    }
                     match res {
                         Ok(TunnelExit::Shutdown) => Step::Shutdown,
                         Err(e) => {
-                            log::warn!("[client] connection lost: {e}, reconnecting in {backoff_ms}ms");
-                            Step::Reconnect
+                            let wait = backoff.next(established);
+                            log::warn!(
+                                "[client] connection lost: {e}, reconnecting in {}ms",
+                                wait.as_millis()
+                            );
+                            Step::Reconnect(wait)
                         }
                     }
                 }
@@ -231,24 +233,25 @@ pub async fn run(config: IpClientConfig) -> Result<(), Box<dyn std::error::Error
                     Step::Signaled
                 }
             };
-            match step {
+            let wait = match step {
                 // Graceful shutdown: the connection is already closed; stop.
                 Step::Shutdown => break,
                 Step::Signaled => {
                     // New path is up — reconnect right away with no backoff,
-                    // binding a fresh socket on the new default interface.
-                    backoff_ms = 500;
+                    // binding a fresh socket on the new default interface. The
+                    // previous failure says nothing about this path, so the
+                    // climb starts over rather than resuming.
+                    backoff.reset();
                     continue;
                 }
-                Step::Reconnect => {}
-            }
+                Step::Reconnect(wait) => wait,
+            };
             // Interruptible backoff: a shutdown during the wait must return
             // promptly instead of blocking the host's stop for up to the backoff.
             tokio::select! {
-                _ = tokio::time::sleep(Duration::from_millis(backoff_ms)) => {}
+                _ = tokio::time::sleep(wait) => {}
                 _ = wait_shutdown(config.shutdown.as_ref()) => break,
             }
-            backoff_ms = (backoff_ms * 2).min(30_000);
         }
     };
 
