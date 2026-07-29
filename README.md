@@ -16,8 +16,9 @@ MASQUE solves exactly this: CONNECT-UDP ([RFC 9298](https://datatracker.ietf.org
 - **CONNECT-IP ([RFC 9484](https://datatracker.ietf.org/doc/html/rfc9484))** — full-tunnel VPN over a TUN device, dual-stack (IPv4 + IPv6), with declarative address assignment and route advertisement capsules ([RFC 9297](https://datatracker.ietf.org/doc/html/rfc9297))
 - **Client + Server** — single binary with `client` / `client-ip` / `server` subcommands
 - **Obfuscation** — traffic appears as standard HTTPS/QUIC on port 443
+- **Decoy site** — anything that is not an authenticated tunnel session is answered as an ordinary web server would, so an active probe sees a website rather than a proxy ([details](#decoy-site---masquerade-dir----masquerade-url))
 - **Handshake that outgrows the first datagram** — the PQ key share pushes the ClientHello past one QUIC Initial, so the SNI is not in the datagram the GFW's QUIC filter inspects ([details](#sni-placement-in-the-handshake))
-- **Authentication** — optional Bearer token for client verification
+- **Authentication** — optional Bearer token for client verification, compared in constant time
 - **Full-tunnel client extras** — `--redirect-gateway` to take over the default route, `--dns` to set system resolvers (both reverted on exit)
 - **Happy Eyeballs ([RFC 8305](https://datatracker.ietf.org/doc/html/rfc8305))** — dual-stack clients race IPv4/IPv6 handshakes so a dead family never wedges connect
 - **RFC-correct hop handling** — ICMP Packet Too Big on oversized packets and hop-count decrement on encapsulation ([RFC 9484 §7.1](https://datatracker.ietf.org/doc/html/rfc9484#section-7.1))
@@ -123,27 +124,25 @@ Server verification defaults to the system/Mozilla CA bundle, so a public ACME (
 | `--ip-routes-file` | | File of routes to advertise (one CIDR per line) — split tunnel | full tunnel |
 | `--dns-assign` | | DNS resolver(s) to advertise to clients (repeatable) | none |
 | `--ip-allow-private` | | Let clients reach private ranges (RFC 1918/CGN/ULA) behind the server | blocked |
+| `--masquerade-dir` | | Serve this directory to non-tunnel requests | built-in page |
+| `--masquerade-url` | | Redirect (302) non-tunnel requests here instead | off |
+| `--server-header` | | Value for the `Server` response header, e.g. `nginx` | none sent |
 
 CONNECT-UDP is always served. CONNECT-IP is enabled only when `--ip-pool` and/or `--ip6-pool` is given; without a pool, `connect-ip` requests are rejected.
 
-### DNS assignment (`--dns-assign`)
+### Decoy site (`--masquerade-dir` / `--masquerade-url`)
 
-RFC 9484 assigns addresses and routes but no resolver, so a CONNECT-IP client otherwise needs `--dns` to know what DNS to use. `--dns-assign <addr>` (repeatable, IPv4/IPv6) makes the server advertise resolvers in a **DNS_ASSIGN capsule** ([draft-ietf-masque-connect-ip-dns](https://datatracker.ietf.org/doc/draft-ietf-masque-connect-ip-dns/)); a client that wasn't given its own `--dns` adopts them automatically. This is a minimal profile (plain Do53 addresses — no encrypted-DNS/SVCB or search domains yet).
+Every request that does not become an authenticated tunnel session is answered as an ordinary web server would. This matters because a proxy that replies `405 Method Not Allowed` to a plain `GET /`, or `407 Proxy Authentication Required` to a wrong token, has identified itself to anyone who asks — and an IP blocklisting, unlike SNI-based filtering, does not expire. The same reasoning drives Trojan's nginx fallback, Hysteria 2's `masquerade:` block, and VLESS+REALITY.
 
-The draft has no IANA-assigned capsule type yet, so both ends hardcode a **provisional codepoint `0x1ACE_79EC`** (`CAPSULE_DNS_ASSIGN` in `src/capsule.rs`). This is a private-use value picked to avoid colliding with RFC 9484's registered types (`0x00`–`0x03`); it **must** be changed to the assigned codepoint once the draft is published as an RFC, and it is not interoperable with any other implementation until then.
+Three modes:
 
-### Split tunnel (`--ip-routes-file`)
+- **`--masquerade-dir <path>`** — serve files from a directory, `index.html` for directory paths. Path traversal is refused in every encoding, and files over 8 MB are treated as absent.
+- **`--masquerade-url <url>`** — answer everything with a `302` to an absolute URL.
+- **neither** — a built-in placeholder page at `/` and a `404` elsewhere.
 
-By default the server advertises a full tunnel (`0.0.0.0/0` and/or `::/0`). To route only specific prefixes through the tunnel, pass `--ip-routes-file` with one CIDR per line (`#` comments and blank lines ignored, IPv4/IPv6 mixed):
+Two properties are load-bearing and covered by `tests/masquerade.rs`: a rejected tunnel request and a plain fetch of the same path produce **byte-identical** responses, and no response names this product. Set `--server-header` to whatever the decoy content should look like it is being served by; it is applied to tunnel responses too, so the two cannot be told apart by it.
 
-```
-# only these go through the tunnel
-10.8.0.0/16
-172.16.0.0/12
-2001:db8:abcd::/48
-```
-
-The server sends these as the RFC 9484 ROUTE_ADVERTISEMENT (each advertisement is the complete set, per §4.7.3). The client installs exactly these prefixes as direct routes via the TUN and leaves the host's default route untouched — so a split tunnel needs no `--redirect-gateway`. The file is read once at startup; a route with no matching assigned address family is skipped.
+The tradeoff for operators: a wrong `--auth-token` no longer produces a distinct error. The client reports the status it got and lists the possible causes, but the server cannot say "bad token" without also saying it to a prober. Server logs still record `Auth failed, serving decoy`.
 
 ### SNI placement in the handshake
 

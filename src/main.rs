@@ -172,6 +172,24 @@ enum Commands {
         /// and --dns-assign resolvers are always reachable.
         #[arg(long)]
         ip_allow_private: bool,
+
+        /// Serve this directory to every request that is not an authenticated
+        /// tunnel session, so an active prober sees a website rather than a
+        /// proxy. index.html is used for directory paths. Without this or
+        /// --masquerade-url, a built-in placeholder page is served.
+        #[arg(long)]
+        masquerade_dir: Option<String>,
+
+        /// Redirect (302) every non-tunnel request to this absolute URL,
+        /// instead of serving local files. Conflicts with --masquerade-dir.
+        #[arg(long, conflicts_with = "masquerade_dir")]
+        masquerade_url: Option<String>,
+
+        /// Value for the `Server` response header, e.g. "nginx". Sent on decoy
+        /// and tunnel responses alike so neither can be told from the other.
+        /// Omit to send no Server header at all.
+        #[arg(long)]
+        server_header: Option<String>,
     },
 }
 
@@ -252,6 +270,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             ip_routes_file,
             dns_assign,
             ip_allow_private,
+            masquerade_dir,
+            masquerade_url,
+            server_header,
         } => {
             server::run(server::ServerConfig {
                 listen,
@@ -265,6 +286,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 ip_routes_file,
                 dns_assign,
                 ip_allow_private,
+                masquerade_dir,
+                masquerade_url,
+                server_header,
             })
             .await
         }

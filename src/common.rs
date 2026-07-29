@@ -1,8 +1,9 @@
 use bytes::{BufMut, Bytes, BytesMut};
 
-/// Product identity sent as the `Server` (server responses) and `User-Agent`
-/// (client requests) header value.
-pub const IDENT: &str = concat!("masque-tunnel/", env!("CARGO_PKG_VERSION"));
+// This crate deliberately puts no product identity on the wire. A `Server:` or
+// `User-Agent:` naming it hands an exact identification to any probe that
+// reaches either end, so the server's header is operator-configured
+// (`--server-header`, empty by default) and the client sends none at all.
 
 /// Well-known URI prefix for CONNECT-UDP (RFC 9298).
 pub const CONNECT_UDP_PATH: &str = "/.well-known/masque/udp";

@@ -528,8 +528,7 @@ async fn run_tunnel(
     let mut req_builder = http::Request::builder()
         .method("CONNECT")
         .uri(uri)
-        .header("capsule-protocol", "?1")
-        .header("user-agent", IDENT);
+        .header("capsule-protocol", "?1");
     if let Some(token) = &config.auth_token {
         req_builder = req_builder.header("proxy-authorization", format!("Bearer {token}"));
     }
@@ -538,7 +537,17 @@ async fn run_tunnel(
     let mut stream = send_request.send_request(req).await?;
     let resp = stream.recv_response().await?;
     if resp.status() != http::StatusCode::OK {
-        return Err(format!("CONNECT-IP rejected: status {}", resp.status()).into());
+        // The proxy answers every unauthenticated request from its decoy site,
+        // so a rejected session looks like an ordinary web response and cannot
+        // name the reason — that indistinguishability is the point. Spell out
+        // the candidates, or a 404 here reads as a wrong path and nothing else.
+        return Err(format!(
+            "CONNECT-IP rejected: status {} (check --auth-token and --proxy-url, \
+             and that the server runs with --ip-pool; the proxy serves its decoy \
+             site to any request it does not accept)",
+            resp.status()
+        )
+        .into());
     }
     if let Some(server) = resp.headers().get("server").and_then(|v| v.to_str().ok()) {
         log::info!("[client] proxy server: {server}");
