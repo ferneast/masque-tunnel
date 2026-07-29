@@ -76,8 +76,11 @@ pub async fn run(config: ClientConfig) -> Result<(), Box<dyn std::error::Error +
     );
 
     // Reconnection loop
-    let mut backoff_ms = 500u64;
+    let mut backoff = Backoff::new();
     loop {
+        // Set by run_tunnel once the CONNECT-UDP session is actually running.
+        let mut established = false;
+
         log::info!("[client] Connecting to {proxy_addr}...");
         let quinn_conn = match endpoint.connect(proxy_addr, &sni) {
             Ok(connecting) => {
@@ -89,19 +92,16 @@ pub async fn run(config: ClientConfig) -> Result<(), Box<dyn std::error::Error +
                             zero_rtt_accepted.await;
                             log::info!("[client] 0-RTT accepted by server");
                         });
-                        backoff_ms = 500;
                         conn
                     }
                     Err(connecting) => match connecting.await {
                         Ok(c) => {
                             log::info!("[client] QUIC connected (full handshake)");
-                            backoff_ms = 500;
                             c
                         }
                         Err(e) => {
                             log::error!("[client] Connection failed: {e}");
-                            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                            backoff_ms = (backoff_ms * 2).min(30_000);
+                            tokio::time::sleep(backoff.next(false)).await;
                             continue;
                         }
                     },
@@ -109,8 +109,7 @@ pub async fn run(config: ClientConfig) -> Result<(), Box<dyn std::error::Error +
             }
             Err(e) => {
                 log::error!("[client] Connect error: {e}");
-                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                backoff_ms = (backoff_ms * 2).min(30_000);
+                tokio::time::sleep(backoff.next(false)).await;
                 continue;
             }
         };
@@ -122,12 +121,46 @@ pub async fn run(config: ClientConfig) -> Result<(), Box<dyn std::error::Error +
             &target_host,
             target_port,
             &config.auth_token,
+            &mut established,
         )
         .await;
 
-        log::warn!("[client] Connection lost: {err}, reconnecting in {backoff_ms}ms");
-        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-        backoff_ms = (backoff_ms * 2).min(30_000);
+        let wait = backoff.next(established);
+        log::warn!(
+            "[client] Connection lost: {err}, reconnecting in {}ms",
+            wait.as_millis()
+        );
+        tokio::time::sleep(wait).await;
+    }
+}
+
+/// Reconnect pacing: the wait doubles after every attempt that did not run a
+/// session, up to a ceiling, and drops back to the floor once one did.
+///
+/// The distinction is the whole point, and it is about the *session*, not the
+/// QUIC handshake. A proxy rejects a bad request — wrong token, wrong path,
+/// CONNECT-IP with no pool — only after the handshake has already succeeded,
+/// so pacing on the handshake makes a permanently broken config reconnect
+/// twice a second forever: useless load on the proxy, and a metronome-regular
+/// pattern that stands out to anyone watching the flow.
+struct Backoff(u64);
+
+impl Backoff {
+    const FLOOR_MS: u64 = 500;
+    const CEILING_MS: u64 = 30_000;
+
+    fn new() -> Self {
+        Self(Self::FLOOR_MS)
+    }
+
+    /// Wait before the next attempt, given whether the last one ran a session.
+    fn next(&mut self, established: bool) -> Duration {
+        if established {
+            self.0 = Self::FLOOR_MS;
+        }
+        let wait = self.0;
+        self.0 = (self.0 * 2).min(Self::CEILING_MS);
+        Duration::from_millis(wait)
     }
 }
 
@@ -138,8 +171,18 @@ async fn run_tunnel(
     target_host: &str,
     target_port: u16,
     auth_token: &Option<String>,
+    established: &mut bool,
 ) -> Box<dyn std::error::Error + Send + Sync> {
-    match run_tunnel_inner(quinn_conn, local, proxy_host, target_host, target_port, auth_token).await
+    match run_tunnel_inner(
+        quinn_conn,
+        local,
+        proxy_host,
+        target_host,
+        target_port,
+        auth_token,
+        established,
+    )
+    .await
     {
         Ok(()) => "tunnel ended".into(),
         Err(e) => e,
@@ -153,6 +196,9 @@ async fn run_tunnel_inner(
     target_host: &str,
     target_port: u16,
     auth_token: &Option<String>,
+    // Set once the proxy has accepted the session, so the caller can tell a
+    // healthy connection that dropped from one that never worked at all.
+    established: &mut bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Clone for datagram I/O — h3-quinn takes ownership of one clone
     let dgram_conn = quinn_conn.clone();
@@ -214,6 +260,9 @@ async fn run_tunnel_inner(
     log::info!(
         "[client] CONNECT-UDP established: h3_index={h3_index} quic_stream_id={quic_stream_id} target={target_host}:{target_port}"
     );
+    // The proxy accepted the session: this attempt genuinely connected, so the
+    // reconnect loop may restart its backoff from the floor.
+    *established = true;
 
     // Datagram forwarding loop
     let mut peer_addr: Option<SocketAddr> = None;
@@ -324,5 +373,46 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
         rustls::crypto::aws_lc_rs::default_provider()
             .signature_verification_algorithms
             .supported_schemes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn waits(b: &mut Backoff, n: usize, established: bool) -> Vec<u64> {
+        (0..n)
+            .map(|_| b.next(established).as_millis() as u64)
+            .collect()
+    }
+
+    #[test]
+    fn backoff_doubles_up_to_the_ceiling_while_nothing_connects() {
+        let mut b = Backoff::new();
+        assert_eq!(
+            waits(&mut b, 8, false),
+            [500, 1000, 2000, 4000, 8000, 16000, 30000, 30000]
+        );
+    }
+
+    #[test]
+    fn a_session_that_ran_returns_the_wait_to_the_floor() {
+        let mut b = Backoff::new();
+        waits(&mut b, 5, false); // climb to 16s
+        assert_eq!(b.next(true).as_millis(), 500);
+    }
+
+    #[test]
+    fn a_rejected_session_never_pins_the_wait_at_the_floor() {
+        // The regression this guards. Resetting the backoff on a completed QUIC
+        // handshake — rather than on a session that actually ran — made a wrong
+        // --auth-token reconnect every 500ms indefinitely, because the proxy
+        // only rejects the request after the handshake succeeds.
+        let mut b = Backoff::new();
+        let observed = waits(&mut b, 6, false);
+        assert!(
+            observed.iter().skip(1).all(|&w| w > Backoff::FLOOR_MS),
+            "every wait after the first must have grown, got {observed:?}"
+        );
     }
 }
