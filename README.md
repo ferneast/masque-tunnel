@@ -90,7 +90,7 @@ Commands:
 | `--target` | `-t` | Target UDP endpoint (host:port) | yes |
 | `--sni` | | TLS SNI override for domain fronting | no |
 | `--auth-token` | | Bearer token for authentication | no |
-| `--ca` | | CA certificate PEM to verify the server | no |
+| `--ca` | | CA certificate PEM to verify the server (default: system roots) | no |
 | `--insecure` | | Skip server certificate verification | no |
 
 ### `client-ip` options (CONNECT-IP full tunnel)
@@ -107,7 +107,7 @@ Commands:
 | `--redirect-gateway` | | Take over the host default route when the proxy advertises a full tunnel; reverted on exit | off |
 | `--dns` | | System resolver(s) to install while up, restored on exit (repeatable) | none |
 
-Server verification defaults to the system/Mozilla CA bundle, so a public ACME (Let's Encrypt) certificate is trusted out of the box; use `--ca` for a private CA or `--insecure` for self-signed testing.
+Both clients resolve trust the same way: server verification defaults to the Mozilla CA bundle, so a public ACME (Let's Encrypt) certificate is trusted out of the box with no flags at all; use `--ca` for a private CA or `--insecure` for self-signed testing.
 
 ### `server` options
 

@@ -19,7 +19,6 @@ use futures_util::StreamExt;
 use tun_rs::AsyncDevice;
 
 use crate::capsule::*;
-use crate::client::SkipServerVerification;
 use crate::common::*;
 
 /// CONNECT-IP client configuration parsed from CLI arguments.
@@ -295,37 +294,7 @@ async fn shutdown_signal() {
 fn build_client_config(
     config: &IpClientConfig,
 ) -> Result<quinn::ClientConfig, Box<dyn std::error::Error + Send + Sync>> {
-    let mut crypto = if config.insecure {
-        rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
-            .with_no_client_auth()
-    } else if let Some(ca_path) = &config.ca {
-        let file = std::fs::File::open(ca_path)?;
-        let mut reader = std::io::BufReader::new(file);
-        let mut roots = rustls::RootCertStore::empty();
-        for cert in rustls_pemfile::certs(&mut reader) {
-            roots.add(cert?)?;
-        }
-        rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth()
-    } else {
-        // Default: the Mozilla CA bundle (webpki-roots), which includes the
-        // ISRG roots real ACME/Let's Encrypt certificates chain to — so iOS
-        // connecting to a public masque host verifies without platform glue.
-        let mut roots = rustls::RootCertStore::empty();
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth()
-    };
-    crypto.alpn_protocols = vec![b"h3".to_vec()];
-    // Allow 0-RTT on reconnect: the shared client config's rustls session store
-    // persists tickets across reconnects, so a resumed handshake sends the
-    // CONNECT-IP request as early data and reaches address assignment one RTT
-    // sooner. quinn transparently falls back to 1-RTT if the server rejects it.
-    crypto.enable_early_data = true;
+    let crypto = build_client_tls_config(&config.ca, config.insecure)?;
 
     let mut transport = quinn::TransportConfig::default();
     transport.initial_mtu(1350);

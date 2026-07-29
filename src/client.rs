@@ -40,7 +40,7 @@ pub async fn run(config: ClientConfig) -> Result<(), Box<dyn std::error::Error +
         .ok_or_else(|| format!("DNS resolution failed for {proxy_host}:{proxy_port}"))?;
 
     // TLS config
-    let client_crypto = build_tls_config(&config.ca, config.insecure)?;
+    let client_crypto = build_client_tls_config(&config.ca, config.insecure)?;
 
     let mut transport = quinn::TransportConfig::default();
     transport.initial_mtu(1350);
@@ -279,70 +279,4 @@ fn parse_target(addr: &str) -> Result<(String, u16), String> {
     }
 }
 
-fn build_tls_config(
-    ca: &Option<String>,
-    insecure: bool,
-) -> Result<rustls::ClientConfig, Box<dyn std::error::Error + Send + Sync>> {
-    let mut config = if insecure {
-        rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
-            .with_no_client_auth()
-    } else if let Some(ca_path) = ca {
-        let file = std::fs::File::open(ca_path)?;
-        let mut reader = std::io::BufReader::new(file);
-        let mut roots = rustls::RootCertStore::empty();
-        for cert in rustls_pemfile::certs(&mut reader) {
-            roots.add(cert?)?;
-        }
-        rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth()
-    } else {
-        return Err("either --insecure or --ca must be specified".into());
-    };
-    config.alpn_protocols = vec![b"h3".to_vec()];
-    config.enable_early_data = true;
-    Ok(config)
-}
-
-#[derive(Debug)]
-pub(crate) struct SkipServerVerification;
-
-impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::aws_lc_rs::default_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
-    }
-}
 
