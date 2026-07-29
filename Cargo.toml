@@ -19,7 +19,14 @@ quinn = { version = "0.11", default-features = false, features = ["runtime-tokio
 h3 = "0.0.8"
 h3-quinn = "0.0.10"
 http = "1"
-rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
+# `prefer-post-quantum` moves X25519MLKEM768 to the head of the key-exchange
+# list, so the ClientHello carries a 1216-byte PQ key share and no longer fits
+# in one ~1200-byte QUIC Initial. The handshake spills across several Initial
+# datagrams, which puts the SNI outside the first one — the only datagram the
+# GFW's QUIC SNI filter inspects (USENIX Security 2025). It also matches what
+# Chrome and Firefox offer first, so the ClientHello reads less like a bespoke
+# stack. Costs ~1.2 KB on the wire per handshake.
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std", "prefer-post-quantum"] }
 rustls-pemfile = "2"
 # Default TLS trust: the Mozilla CA bundle, so the CONNECT-IP client (incl. iOS)
 # verifies public ACME certificates without platform-specific trust glue.

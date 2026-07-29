@@ -16,6 +16,7 @@ MASQUE solves exactly this: CONNECT-UDP ([RFC 9298](https://datatracker.ietf.org
 - **CONNECT-IP ([RFC 9484](https://datatracker.ietf.org/doc/html/rfc9484))** — full-tunnel VPN over a TUN device, dual-stack (IPv4 + IPv6), with declarative address assignment and route advertisement capsules ([RFC 9297](https://datatracker.ietf.org/doc/html/rfc9297))
 - **Client + Server** — single binary with `client` / `client-ip` / `server` subcommands
 - **Obfuscation** — traffic appears as standard HTTPS/QUIC on port 443
+- **Handshake that outgrows the first datagram** — the PQ key share pushes the ClientHello past one QUIC Initial, so the SNI is not in the datagram the GFW's QUIC filter inspects ([details](#sni-placement-in-the-handshake))
 - **Authentication** — optional Bearer token for client verification
 - **Full-tunnel client extras** — `--redirect-gateway` to take over the default route, `--dns` to set system resolvers (both reverted on exit)
 - **Happy Eyeballs ([RFC 8305](https://datatracker.ietf.org/doc/html/rfc8305))** — dual-stack clients race IPv4/IPv6 handshakes so a dead family never wedges connect
@@ -124,6 +125,33 @@ Server verification defaults to the system/Mozilla CA bundle, so a public ACME (
 | `--ip-allow-private` | | Let clients reach private ranges (RFC 1918/CGN/ULA) behind the server | blocked |
 
 CONNECT-UDP is always served. CONNECT-IP is enabled only when `--ip-pool` and/or `--ip6-pool` is given; without a pool, `connect-ip` requests are rejected.
+
+### DNS assignment (`--dns-assign`)
+
+RFC 9484 assigns addresses and routes but no resolver, so a CONNECT-IP client otherwise needs `--dns` to know what DNS to use. `--dns-assign <addr>` (repeatable, IPv4/IPv6) makes the server advertise resolvers in a **DNS_ASSIGN capsule** ([draft-ietf-masque-connect-ip-dns](https://datatracker.ietf.org/doc/draft-ietf-masque-connect-ip-dns/)); a client that wasn't given its own `--dns` adopts them automatically. This is a minimal profile (plain Do53 addresses — no encrypted-DNS/SVCB or search domains yet).
+
+The draft has no IANA-assigned capsule type yet, so both ends hardcode a **provisional codepoint `0x1ACE_79EC`** (`CAPSULE_DNS_ASSIGN` in `src/capsule.rs`). This is a private-use value picked to avoid colliding with RFC 9484's registered types (`0x00`–`0x03`); it **must** be changed to the assigned codepoint once the draft is published as an RFC, and it is not interoperable with any other implementation until then.
+
+### Split tunnel (`--ip-routes-file`)
+
+By default the server advertises a full tunnel (`0.0.0.0/0` and/or `::/0`). To route only specific prefixes through the tunnel, pass `--ip-routes-file` with one CIDR per line (`#` comments and blank lines ignored, IPv4/IPv6 mixed):
+
+```
+# only these go through the tunnel
+10.8.0.0/16
+172.16.0.0/12
+2001:db8:abcd::/48
+```
+
+The server sends these as the RFC 9484 ROUTE_ADVERTISEMENT (each advertisement is the complete set, per §4.7.3). The client installs exactly these prefixes as direct routes via the TUN and leaves the host's default route untouched — so a split tunnel needs no `--redirect-gateway`. The file is read once at startup; a route with no matching assigned address family is skipped.
+
+### SNI placement in the handshake
+
+A QUIC Initial packet is encrypted with keys derived from the destination connection ID and a fixed, published salt, so any observer on the path can decrypt it and read the SNI. The GFW has done exactly this at national scale since August 2024 ([USENIX Security 2025](https://gfw.report/publications/usenixsecurity25/en/)); a match drops every packet of the `(src IP, dst IP, dst port)` triple for 180 seconds, which presents as "the tunnel died and came back a few minutes later".
+
+That filter inspects only the **first datagram** of a flow and does not reassemble a ClientHello spread across several. This build enables rustls's `prefer-post-quantum`, which offers `X25519MLKEM768` first; its ~1216-byte key share pushes the ClientHello over the ~1200-byte Initial budget, so the handshake occupies two datagrams and the SNI is not in the one being read. `tests/initial_flight.rs` asserts the spill, and fails if a dependency change quietly shrinks the ClientHello again.
+
+Two caveats worth being clear about. This exploits an implementation shortcut, not a protocol property — it holds until the filter learns to reassemble. And the GFW's QUIC list is a *blocklist*: a domain that was never listed was never being filtered on SNI, so this is insurance against your domain being added, not necessarily a fix for a connection failing today. It also costs ~1.2 KB per handshake, and does nothing about an IP-level block.
 
 ### DNS assignment (`--dns-assign`)
 
