@@ -38,10 +38,16 @@ typedef struct {
     // (DNS_ASSIGN, draft-ietf-masque-connect-ip-dns): ["8.8.8.8", ...]
     // Called only when the proxy advertises DNS.
     void (*on_dns)(void *ctx, const char *dns_json);
+    // The tunnel dropped and auto_reconnect was false at start: the client is
+    // holding until the host triggers the retry. Prepare the platform (set the
+    // provider's reasserting = true) and call masque_client_ip_reconnect.
+    // May also fire when the *initial* connect fails. Never called with
+    // auto_reconnect true. detail carries the error text (never NULL).
+    void (*on_retry)(void *ctx, const char *detail);
 } MasqueCallbacks;
 
-// Starts the CONNECT-IP client. Reconnects internally with backoff until
-// stopped; fatal setup errors surface via on_state(2, detail).
+// Starts the CONNECT-IP client. Fatal setup errors surface via
+// on_state(2, detail).
 //   proxy_url:  MASQUE proxy URL, e.g. "https://relay.example.com" (required)
 //   auth_token: Bearer token for proxy authorization (NULL = none)
 //   sni:        TLS SNI override for domain fronting (NULL = host of proxy_url)
@@ -51,6 +57,10 @@ typedef struct {
 //               The first entry of each family is used. A held address, kept
 //               across reconnects, always takes precedence.
 //   insecure:   skip server certificate verification (self-signed servers)
+//   auto_reconnect: true = retry dropped tunnels internally with backoff;
+//               false = each drop fires on_retry and the client holds until
+//               masque_client_ip_reconnect (for hosts that must prepare the
+//               platform first, e.g. an iOS provider entering reasserting)
 //   mtu:        TUN MTU; 0 selects the default (1280)
 //   tun_fd:     dup of the provider's utun fd; the client takes ownership
 // Returns an opaque handle, or NULL on invalid input.
@@ -59,6 +69,7 @@ MasqueHandle *masque_client_ip_start(const char *proxy_url,
                                      const char *sni,
                                      const char *preferred_addresses,
                                      bool insecure,
+                                     bool auto_reconnect,
                                      uint16_t mtu,
                                      int32_t tun_fd,
                                      MasqueCallbacks callbacks);
@@ -77,10 +88,11 @@ void masque_client_ip_stats(const MasqueHandle *handle,
 // handle must be live (not yet stopped).
 void masque_client_ip_update_tun_fd(const MasqueHandle *handle, int32_t tun_fd);
 
-// Signals the client to drop its current connection and reconnect immediately,
-// bypassing the QUIC idle-timeout wait. Call when the host detects a network
-// path change (e.g. Wi-Fi <-> cellular). No-op if not running. handle must be
-// live (not yet stopped).
+// Signals the client to reconnect immediately. With a tunnel up it drops the
+// connection and redials at once, bypassing the QUIC idle-timeout wait — call
+// on a network path change (e.g. Wi-Fi <-> cellular). After an on_retry
+// (auto_reconnect false) it releases the held retry. No-op if not running.
+// handle must be live (not yet stopped).
 void masque_client_ip_reconnect(const MasqueHandle *handle);
 
 // Stops the client, joins its worker thread, and frees the handle.

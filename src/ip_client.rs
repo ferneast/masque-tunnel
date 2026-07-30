@@ -67,6 +67,13 @@ pub struct IpClientConfig {
     /// can hand back a stable IP from the very first connect. Once an address is
     /// assigned it is held on the TUN binding and always takes precedence.
     pub preferred_addresses: Vec<IpAddr>,
+    /// Reconnect automatically (with backoff) when the tunnel drops. When
+    /// false, a drop instead fires `ClientEvents::reconnect_needed` and the
+    /// client waits for the host's `reconnect` signal — an iOS provider must
+    /// move the tunnel to reasserting before a reconnect can succeed, so the
+    /// host owns the retry decision there. Requires `reconnect` to be wired;
+    /// with neither, a dropped tunnel waits until shutdown. Desktop uses true.
+    pub auto_reconnect: bool,
 }
 
 /// Cumulative tunneled traffic since start: `tx` counts IP bytes sent to the
@@ -131,6 +138,11 @@ pub trait ClientEvents: Send + Sync {
     /// Default: ignore — a host that does not program DNS from capsules (e.g.
     /// one relying on the platform default) can leave this unimplemented.
     fn dns_assigned(&self, _servers: &[IpAddr]) {}
+    /// The tunnel dropped and `auto_reconnect` is off: the client is now
+    /// waiting for the host's `reconnect` signal. The host prepares the
+    /// platform (iOS: `NEPacketTunnelProvider.reasserting = true`) and then
+    /// triggers the reconnect. Default: ignore (auto-reconnect hosts).
+    fn reconnect_needed(&self, _detail: &str) {}
 }
 
 /// The active TUN device plus the assignment it was configured with. `fd` is
@@ -169,7 +181,9 @@ enum TunnelExit {
     Shutdown,
 }
 
-/// Run the MASQUE CONNECT-IP client with automatic reconnection.
+/// Run the MASQUE CONNECT-IP client. Reconnects automatically with backoff,
+/// or — with `auto_reconnect` off — surfaces each drop to the host via
+/// `ClientEvents::reconnect_needed` and waits for its `reconnect` signal.
 pub async fn run(config: IpClientConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let url = url::Url::parse(&config.proxy_url)?;
     let proxy_host = url.host_str().ok_or("missing host in proxy URL")?.to_string();
@@ -199,6 +213,8 @@ pub async fn run(config: IpClientConfig) -> Result<(), Box<dyn std::error::Error
     enum Step {
         /// Wait this long, then reconnect.
         Reconnect(Duration),
+        /// Wait for the host's reconnect signal (host-driven retry).
+        AwaitSignal,
         Signaled,
         Shutdown,
     }
@@ -222,13 +238,23 @@ pub async fn run(config: IpClientConfig) -> Result<(), Box<dyn std::error::Error
                 ) => {
                     match res {
                         Ok(TunnelExit::Shutdown) => Step::Shutdown,
-                        Err(e) => {
+                        Err(e) if config.auto_reconnect => {
                             let wait = backoff.next(established);
                             log::warn!(
                                 "[client] connection lost: {e}, reconnecting in {}ms",
                                 wait.as_millis()
                             );
                             Step::Reconnect(wait)
+                        }
+                        Err(e) => {
+                            // Host-driven retry: surface the drop and hold until
+                            // the host has prepared the platform (iOS sets the
+                            // tunnel reasserting) and signals the reconnect.
+                            log::warn!("[client] connection lost: {e}, waiting for host reconnect");
+                            if let Some(events) = &config.events {
+                                events.reconnect_needed(&e.to_string());
+                            }
+                            Step::AwaitSignal
                         }
                     }
                 }
@@ -247,6 +273,16 @@ pub async fn run(config: IpClientConfig) -> Result<(), Box<dyn std::error::Error
                     // climb starts over rather than resuming.
                     backoff.reset();
                     continue;
+                }
+                Step::AwaitSignal => {
+                    tokio::select! {
+                        _ = wait_reconnect(config.reconnect.as_ref()) => {
+                            log::info!("[client] host requested reconnect");
+                            backoff.reset();
+                            continue;
+                        }
+                        _ = wait_shutdown(config.shutdown.as_ref()) => break,
+                    }
                 }
                 Step::Reconnect(wait) => wait,
             };

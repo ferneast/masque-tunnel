@@ -38,6 +38,11 @@ pub struct MasqueCallbacks {
     /// (DNS_ASSIGN, draft-ietf-masque-connect-ip-dns). The host programs
     /// `NEDNSSettings` from these. Called only when the proxy advertises DNS.
     pub on_dns: extern "C" fn(ctx: *mut c_void, dns_json: *const c_char),
+    /// The tunnel dropped and `auto_reconnect` was false at start: the client
+    /// is holding until the host triggers the retry. The host prepares the
+    /// platform (set the provider reasserting) and calls
+    /// `masque_client_ip_reconnect`. Never called with `auto_reconnect` true.
+    pub on_retry: extern "C" fn(ctx: *mut c_void, detail: *const c_char),
 }
 
 // The host guarantees the pointers stay valid for the tunnel's lifetime.
@@ -121,6 +126,12 @@ impl ClientEvents for HostEvents {
             (self.cb.on_dns)(self.cb.ctx, json.as_ptr());
         }
     }
+    fn reconnect_needed(&self, detail: &str) {
+        // An interior NUL in the error text must not swallow the event; the
+        // host needs the wake-up more than the detail.
+        let detail = CString::new(detail).unwrap_or_default();
+        (self.cb.on_retry)(self.cb.ctx, detail.as_ptr());
+    }
 }
 
 fn dns_json(servers: &[IpAddr]) -> String {
@@ -175,7 +186,11 @@ unsafe fn cstr(p: *const c_char) -> Option<String> {
 /// `"10.99.0.2,2001:db8::2"`) preferred on a cold start, before any address is
 /// assigned, so the proxy can hand back a stable IP; the first entry of each
 /// family is used. Null, empty, or unparseable entries keep the previous "no
-/// preference" behavior. Returns an opaque handle, or null on invalid input.
+/// preference" behavior. With `auto_reconnect` the client retries dropped
+/// tunnels itself (backoff); without it each drop fires `on_retry` and the
+/// client holds until `masque_client_ip_reconnect` — for hosts that must
+/// prepare the platform first (iOS reasserting). Returns an opaque handle, or
+/// null on invalid input.
 ///
 /// # Safety
 /// `proxy_url` must be a valid NUL-terminated UTF-8 string; `auth_token`,
@@ -188,6 +203,7 @@ pub unsafe extern "C" fn masque_client_ip_start(
     sni: *const c_char,
     preferred_addresses: *const c_char,
     insecure: bool,
+    auto_reconnect: bool,
     mtu: u16,
     tun_fd: RawFd,
     callbacks: MasqueCallbacks,
@@ -233,6 +249,7 @@ pub unsafe extern "C" fn masque_client_ip_start(
         reconnect: Some(reconnect.clone()),
         shutdown: Some(shutdown.clone()),
         preferred_addresses,
+        auto_reconnect,
     };
 
     let thread = std::thread::spawn(move || {
@@ -286,9 +303,11 @@ pub unsafe extern "C" fn masque_client_ip_update_tun_fd(
     (*handle).tun_fd.replace(tun_fd);
 }
 
-/// Signal the client to drop its current connection and reconnect immediately,
-/// bypassing the QUIC idle-timeout wait. Call when the host detects a network
-/// path change (e.g. Wi-Fi ↔ cellular). No-op if the client is not running.
+/// Signal the client to reconnect immediately: with a tunnel up, it drops the
+/// connection and redials at once (bypassing the QUIC idle-timeout wait — call
+/// on a network path change, e.g. Wi-Fi ↔ cellular); after an `on_retry`
+/// (`auto_reconnect` off), it releases the held retry. No-op if the client is
+/// not running.
 ///
 /// # Safety
 /// `handle` must be a live pointer returned by `masque_client_ip_start` (not

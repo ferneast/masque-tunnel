@@ -256,6 +256,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 reconnect: None,
                 shutdown: None,
                 preferred_addresses: preferred_address,
+                auto_reconnect: true,
             })
             .await
         }
