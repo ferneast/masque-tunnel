@@ -22,7 +22,8 @@ MASQUE solves exactly this: CONNECT-UDP ([RFC 9298](https://datatracker.ietf.org
 - **Full-tunnel client extras** — `--redirect-gateway` to take over the default route, `--dns` to set system resolvers (both reverted on exit)
 - **Happy Eyeballs ([RFC 8305](https://datatracker.ietf.org/doc/html/rfc8305))** — dual-stack clients race IPv4/IPv6 handshakes so a dead family never wedges connect
 - **RFC-correct hop handling** — ICMP Packet Too Big on oversized packets and hop-count decrement on encapsulation ([RFC 9484 §7.1](https://datatracker.ietf.org/doc/html/rfc9484#section-7.1))
-- **Auto-reconnect** — client reconnects with exponential backoff
+- **Reconnects that keep the tunnel IP** — the client asks for the address it already holds, and the server hands it back even if another session picked it up after a restart ([details](#address-stability-across-reconnects))
+- **Auto-reconnect** — exponential backoff by default; embedders can instead drive each retry themselves ([details](#reconnect-control))
 - **Static binaries** — musl-linked, runs on any Linux (including RouterOS containers); iOS/tvOS static library for `NEPacketTunnelProvider`
 
 ## Quick Start
@@ -73,11 +74,13 @@ sudo masque-tunnel client-ip \
 ## Usage
 
 ```
-masque-tunnel <COMMAND>
+MASQUE tunnel: CONNECT-UDP (RFC 9298) and CONNECT-IP (RFC 9484)
+
+Usage: masque-tunnel <COMMAND>
 
 Commands:
-  client     Run as MASQUE CONNECT-UDP client (local UDP socket)
-  client-ip  Run as MASQUE CONNECT-IP client (full-tunnel VPN over a TUN device)
+  client     Run as MASQUE CONNECT-UDP client
+  client-ip  Run as MASQUE CONNECT-IP client: a full-tunnel VPN over a local TUN device (requires root to create the TUN)
   server     Run as MASQUE proxy server (CONNECT-UDP always; CONNECT-IP with --ip-pool)
 ```
 
@@ -106,6 +109,7 @@ Commands:
 | `--tun-name` | | TUN device name (Linux: any; macOS: `utunN`) | auto |
 | `--redirect-gateway` | | Take over the host default route when the proxy advertises a full tunnel; reverted on exit | off |
 | `--dns` | | System resolver(s) to install while up, restored on exit (repeatable) | none |
+| `--preferred-address` | | Tunnel address to request on a cold start, before any is assigned (repeatable, one per family) | no preference |
 
 Both clients resolve trust the same way: server verification defaults to the Mozilla CA bundle, so a public ACME (Let's Encrypt) certificate is trusted out of the box with no flags at all; use `--ca` for a private CA or `--insecure` for self-signed testing.
 
@@ -156,6 +160,8 @@ Two caveats worth being clear about. This exploits an implementation shortcut, n
 
 RFC 9484 assigns addresses and routes but no resolver, so a CONNECT-IP client otherwise needs `--dns` to know what DNS to use. `--dns-assign <addr>` (repeatable, IPv4/IPv6) makes the server advertise resolvers in a **DNS_ASSIGN capsule** ([draft-ietf-masque-connect-ip-dns](https://datatracker.ietf.org/doc/draft-ietf-masque-connect-ip-dns/)); a client that wasn't given its own `--dns` adopts them automatically. This is a minimal profile (plain Do53 addresses — no encrypted-DNS/SVCB or search domains yet).
 
+An explicit `--dns` on the client is permanent and always wins. An adopted set is treated as proxy state instead: a later `DNS_ASSIGN` naming different resolvers replaces it in place, so a client reconnecting to a reconfigured proxy follows the change rather than holding a resolver that has moved.
+
 The draft has no IANA-assigned capsule type yet, so both ends hardcode a **provisional codepoint `0x1ACE_79EC`** (`CAPSULE_DNS_ASSIGN` in `src/capsule.rs`). This is a private-use value picked to avoid colliding with RFC 9484's registered types (`0x00`–`0x03`); it **must** be changed to the assigned codepoint once the draft is published as an RFC, and it is not interoperable with any other implementation until then.
 
 ### Split tunnel (`--ip-routes-file`)
@@ -170,6 +176,14 @@ By default the server advertises a full tunnel (`0.0.0.0/0` and/or `::/0`). To r
 ```
 
 The server sends these as the RFC 9484 ROUTE_ADVERTISEMENT (each advertisement is the complete set, per §4.7.3). The client installs exactly these prefixes as direct routes via the TUN and leaves the host's default route untouched — so a split tunnel needs no `--redirect-gateway`. The file is read once at startup; a route with no matching assigned address family is skipped.
+
+### Address stability across reconnects
+
+A tunnel that renumbers on every reconnect breaks every connection running over it, so the client asks to keep the address it already has. On reconnect it puts its currently held address in the `ADDRESS_REQUEST` (RFC 9484 §4.7.2); on a cold start it asks for `--preferred-address` if given, else the all-zero "no preference". The server grants any request that names a valid host address of its pool, including one still held by a session whose QUIC connection has not been reaped yet — which is exactly the reconnecting client's own previous session.
+
+That reclaim also covers a case a proxy restart creates: the lease table is lost, so another client may have been handed the address in the meantime. The proxy hands it back to the client that asks for it by name and tells the current holder, which drops the address, takes a replacement from the pool — usually the requester's freed one, making it a swap — and receives an unsolicited `ADDRESS_ASSIGN` with its new set. Without that notification the loser's downstream would point at the new owner while its own connection stayed up: a silent blackhole with no reason to reconnect.
+
+The client is correspondingly careful about its own reconnects. It caches the address that carried the last established tunnel and dials it directly if DNS is slow or failing, because with `--redirect-gateway` the tunnel's routes (and any `--dns` takeover) intentionally stay installed while it is down — so the resolver may be unreachable exactly when it is needed. For the same reason it pins *every* candidate proxy address to the real gateway, not just the connected one, so a reconnect that lands on a different DNS answer or address family still escapes the split default.
 
 ### Destination filtering
 
@@ -217,8 +231,12 @@ The kernel UDP socket buffer defaults (`net.core.rmem_max` ≈ 208 KB on most Li
 ```bash
 sudo sysctl -w net.core.rmem_max=67108864 net.core.rmem_default=16777216
 sudo sysctl -w net.core.wmem_max=67108864 net.core.wmem_default=16777216
-# Persist across reboots: drop the same lines into /etc/sysctl.d/99-masque.conf
+# Persist across reboots: drop the same lines into /etc/sysctl.d/999-masque.conf
 ```
+
+Two things make that persistence easy to get wrong. Files in `/etc/sysctl.d/` are applied in filename order, so a `99-masque.conf` loses to the `99-sysctl.conf` most distros ship — use a `999-` prefix. And `/etc/sysctl.conf` is applied *last* of all, overriding everything in `/etc/sysctl.d/`; several cloud images (Alibaba, Tencent, AWS Debian) set `net.core.wmem_max=4194304` there, which silently undoes the tuning. Comment those lines out, run `sudo sysctl --system`, and verify the runtime values with `sudo sysctl net.core.rmem_max net.core.wmem_max` rather than trusting the file.
+
+To confirm it reached the socket, check the receive buffer of the running server: `sudo ss -ulnpm | grep -A1 :443` should show `rb16777216` and `d0` (no drops), not the default `rb212992`.
 
 QUIC starts with an optimistic 1350-byte MTU and adapts via path MTU discovery. Set the tunneled interface (WireGuard MTU, or the CONNECT-IP `--mtu`) to **1280** so packets fit inside a QUIC DATAGRAM on typical paths; a packet too large for one datagram is answered with an ICMP Packet Too Big rather than dropped silently, but sizing it down avoids the round trip.
 
@@ -283,7 +301,15 @@ let connection = NWConnection(host: "10.0.0.1", port: 51820, using: parameters)
 connection.start(queue: .global(qos: .userInitiated))
 ```
 
-**CONNECT-IP** — the full-tunnel client is exposed as a C ABI (`src/ffi.rs`) for use inside a `NEPacketTunnelProvider`. The host hands the Rust core a `dup` of the provider's utun file descriptor via `masque_client_ip_start`, and programs `NEIPv4Settings` / routes / DNS from the assigned-address and route-advertisement callbacks; `masque_client_ip_stop` tears it down. Build the static library for the Apple targets (`crate-type = ["staticlib"]`) and wrap it in an xcframework.
+**CONNECT-IP** — the full-tunnel client is exposed as a C ABI (`src/ffi.rs`, header in `include/masque_ffi.h`) for use inside a `NEPacketTunnelProvider`. The host hands the Rust core a `dup` of the provider's utun file descriptor via `masque_client_ip_start`, and programs `NEIPv4Settings` / routes / DNS from the `on_addresses`, `on_routes`, and `on_dns` callbacks; `masque_client_ip_stop` tears it down. Two calls handle the platform's habit of changing things underneath a live tunnel: `masque_client_ip_update_tun_fd` swaps in a replacement fd after a settings apply rebuilds the interface, without dropping the QUIC connection, and `masque_client_ip_reconnect` forces an immediate redial when the provider sees a path change. Build the static library for the Apple targets (`crate-type = ["staticlib"]`) and wrap it in an xcframework (`build_xcframework.sh`).
+
+#### Reconnect control
+
+`masque_client_ip_start` takes an `auto_reconnect` flag. With it set the client retries dropped tunnels itself with exponential backoff, which is what the CLI does and what a simple embedder wants.
+
+An iOS provider usually wants the opposite. It may need to set `reasserting`, or rebuild platform state, before a redial can succeed — and the Rust core cannot do that on its own. With `auto_reconnect` false, each drop instead fires the `on_retry` callback and the client holds, keeping its QUIC configuration, TUN binding, and assigned addresses, until the host calls `masque_client_ip_reconnect`. The host owns the retry decision, and the same call doubles as the release.
+
+Nothing throttles that loop on the Rust side: if a retry fails, `on_retry` fires again as soon as the attempt does, which for an immediately-refused path (no network, bad token) can be milliseconds. A host driving retries itself should apply its own backoff and give up after a bounded number of attempts rather than reconnecting unconditionally.
 
 ## Build from Source
 
@@ -291,19 +317,28 @@ connection.start(queue: .global(qos: .userInitiated))
 cargo build --release
 ```
 
-The release binary is statically linked (musl) and optimized with LTO. The crate also builds a `staticlib` for the iOS/tvOS FFI.
+That builds for the host with fat LTO. For a portable Linux server binary, build against musl so the result is fully static and runs on any distro regardless of its glibc version:
 
-> **Note:** the `h3` crate (0.0.8) is vendored under `vendor/h3` with a one-line patch (via `[patch.crates-io]`) that adds `connect-ip` to its `:protocol` pseudo-header enum — upstream only accepts `webtransport`/`connect-udp` and rejects `connect-ip` with `H3_MESSAGE_ERROR` before the request reaches the handler.
+```bash
+rustup target add x86_64-unknown-linux-musl
+cargo build --release --target x86_64-unknown-linux-musl
+```
+
+Cross-compiling to that target from macOS works with [`cargo-zigbuild`](https://github.com/rust-cross/cargo-zigbuild) (`brew install zig && cargo install cargo-zigbuild`, then `cargo zigbuild` in place of `cargo build`). Verify the result with `file` — it should say `statically linked`. The crate also builds a `staticlib` for the iOS/tvOS FFI.
+
+> **Note:** the `h3` crate (0.0.8) is vendored under `vendor/h3` (via `[patch.crates-io]`) with `connect-ip` added to its closed `:protocol` pseudo-header enum — upstream only accepts `webtransport`/`connect-udp` and rejects `connect-ip` with `H3_MESSAGE_ERROR` before the request reaches the handler.
 
 ## Architecture
 
 ```
 src/
 ├── main.rs          # CLI entry point (client / client-ip / server)
+├── lib.rs           # Library root; gates the server modules off non-desktop targets
 ├── client.rs        # CONNECT-UDP client: local UDP ↔ QUIC DATAGRAM
 ├── ip_client.rs     # CONNECT-IP client: TUN ↔ QUIC DATAGRAM + capsules (full-tunnel VPN)
 ├── server.rs        # Server: auth + CONNECT-UDP forwarding + CONNECT-IP dispatch
 ├── ip_server.rs     # CONNECT-IP server: TUN, address pools, downstream routing
+├── masquerade.rs    # Decoy site served to everything that is not a tunnel session
 ├── capsule.rs       # RFC 9297 capsule framing + RFC 9484 ADDRESS/ROUTE capsules
 ├── icmp.rs          # ICMP Packet Too Big generation (RFC 9484 §7.1)
 ├── route.rs         # Host route management (client full-tunnel redirect)
@@ -332,10 +367,12 @@ apps ──▶ TUN ──▶ client ──QUIC/H3──▶ server ──▶ TUN 
 ```
 
 1. Client sends an extended CONNECT (`:protocol = connect-ip`) with path `/.well-known/masque/ip/*/*/`.
-2. Server replies `200`; the client then sends an `ADDRESS_REQUEST` (one no-preference entry per family) on the request stream.
-3. Server answers with an `ADDRESS_ASSIGN` (a /32 and/or /128 from its pool, echoing the Request IDs) plus a `ROUTE_ADVERTISEMENT` for the default route (RFC 9484 capsules).
+2. Server replies `200`; the client then sends an `ADDRESS_REQUEST` on the request stream, one entry per family — asking for the address it already holds (on a reconnect), else `--preferred-address`, else the all-zero "no preference".
+3. Server answers with an `ADDRESS_ASSIGN` (a /32 and/or /128 from its pool, echoing the Request IDs), a `ROUTE_ADVERTISEMENT` (the default route, or the `--ip-routes-file` set), and a `DNS_ASSIGN` if `--dns-assign` is configured.
 4. Client brings up a TUN with the assigned address; IP packets travel as QUIC DATAGRAMs (context-id 0), while capsules travel on the request stream.
-5. The server writes upstream packets to a shared TUN (source-validated against the assigned address) and routes downstream packets by destination; the kernel handles forwarding, NAT, and the hop-count decrement.
+5. The server writes upstream packets to a shared TUN (source-validated against the assigned address, destination-filtered per the policy above) and routes downstream packets by destination; the kernel handles forwarding, NAT, and the hop-count decrement.
+
+Both address and route capsules are **declarative**: each one carries the complete current set, and either side reconciles to match rather than accumulating. A later `ADDRESS_ASSIGN` renumbers the live TUN in place (keeping the device and its routes), and an empty one withdraws everything.
 
 ## Standards conformance
 
@@ -357,11 +394,15 @@ Relative to RFC 9484, the following is **not** implemented:
   request naming a specific target IP or IP protocol is rejected with `400`
   ([§4.1](https://datatracker.ietf.org/doc/html/rfc9484#section-4.1) permits a
   proxy to refuse these). There is no per-flow or per-protocol packet filtering.
-- **Client-requested specific addresses.** The server pre-assigns one host
-  address per family, sequentially from its pool, and answers `ADDRESS_REQUEST`
-  only from that pre-assigned set. A request for a specific address the client
-  was not already assigned — or for a non-host prefix length — is refused with an
-  all-zero `AssignedAddress`. There is no on-demand allocation or renumbering.
+- **Prefix assignment.** Only single host addresses are handed out (`/32` and/or
+  `/128`), one per family. The prefix length in an `ADDRESS_REQUEST` is ignored
+  rather than honored or refused — a request is matched on its address alone,
+  and the answer always carries the host prefix length. Assigning a shorter
+  prefix to route a subnet behind the client is not supported. (Requesting a
+  *specific* address is — see
+  [Address stability](#address-stability-across-reconnects).) A request naming
+  an address outside the pool is refused with an all-zero `AssignedAddress`, as
+  [§4.7.1](https://datatracker.ietf.org/doc/html/rfc9484#section-4.7.1) allows.
 - **Per-protocol routes.** `ROUTE_ADVERTISEMENT` always uses IP Protocol `0`
   (all protocols); the per-protocol scoping the capsule allows is not produced.
 - **Bidirectional / client-as-router.** The client only consumes

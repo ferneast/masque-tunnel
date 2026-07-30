@@ -25,7 +25,7 @@ static STDERR_LOGGER: StderrLogger = StderrLogger;
 #[derive(Parser)]
 #[command(
     name = "masque-tunnel",
-    about = "MASQUE CONNECT-UDP tunnel (RFC 9298)",
+    about = "MASQUE tunnel: CONNECT-UDP (RFC 9298) and CONNECT-IP (RFC 9484)",
     version
 )]
 struct Cli {
