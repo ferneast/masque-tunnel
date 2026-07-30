@@ -169,6 +169,10 @@ struct DownstreamFlow {
     /// Owning session generation (see `NEXT_SESSION_GEN`); a session's cleanup
     /// only reclaims a route entry whose generation still matches its own.
     gen: u64,
+    /// Wakes the owning session's capsule loop when a newer session takes this
+    /// address over, so the loser renumbers instead of being silently
+    /// blackholed (its downstream now points at the new owner).
+    evictions: mpsc::UnboundedSender<IpAddr>,
 }
 
 /// Shared CONNECT-IP state. Global across QUIC connections: the TUN device
@@ -718,6 +722,9 @@ struct SessionCtx {
     conn: quinn::Connection,
     stream_id: u64,
     gen: u64,
+    /// Sender half of this session's eviction channel; cloned into every route
+    /// entry so the session that takes an address over can notify this one.
+    evict_tx: mpsc::UnboundedSender<IpAddr>,
 }
 
 impl SessionCtx {
@@ -726,16 +733,21 @@ impl SessionCtx {
             conn: self.conn.clone(),
             stream_id: self.stream_id,
             gen: self.gen,
+            evictions: self.evict_tx.clone(),
         }
     }
 }
 
 /// Apply any specific (non-wildcard) requested address from an ADDRESS_REQUEST,
 /// swapping it in for this session's provisionally assigned address of the same
-/// family. A requested address still held by a stale session (its QUIC
-/// connection not yet reaped) is taken over: the route entry is repointed here,
-/// and the prior owner's generation-keyed cleanup then leaves it alone. Invalid
-/// or non-grantable preferences are ignored, keeping the provisional assignment.
+/// family. A requested address still held by another session — stale (its QUIC
+/// connection not yet reaped) or live (a server restart loses the lease state,
+/// so another client may hold it provisionally) — is taken over: the route
+/// entry is repointed here and the prior owner is told through its eviction
+/// channel, so a live one renumbers (see `handle_eviction`) while a stale one
+/// never reads the notice; its generation-keyed cleanup leaves the entry
+/// alone either way. Invalid or non-grantable preferences are ignored,
+/// keeping the provisional assignment.
 fn honor_requested_addresses(ctx: &SessionCtx, requests: &[RequestedAddress]) {
     for r in requests {
         if r.addr.is_unspecified() {
@@ -749,12 +761,21 @@ fn honor_requested_addresses(ctx: &SessionCtx, requests: &[RequestedAddress]) {
             continue; // not a grantable client address; keep the provisional one
         };
         // Swap the granted address in for the provisional same-family one,
-        // repointing the downstream route (evicting any stale owner). Locks are
+        // repointing the downstream route (evicting any prior owner). Locks are
         // released before touching the pool to keep a single routes→assigned→pool
         // acquisition order across the file.
-        let old_to_free = {
+        let (old_to_free, prior_owner) = {
             let mut routes = ctx.state.routes.write().unwrap();
             let mut assigned = ctx.assigned.lock().unwrap();
+            // The prior owner's eviction channel, captured before its route
+            // entry is overwritten. It may be a live session, not a stale one:
+            // a server restart loses the lease state, so another client can
+            // hold this address provisionally by the time its old owner
+            // reconnects and asks for it back.
+            let prior = routes
+                .get(&granted)
+                .filter(|f| f.gen != ctx.gen)
+                .map(|f| f.evictions.clone());
             let old = if let Some(pos) = assigned.iter().position(|a| a.is_ipv6() == want_v6) {
                 let old = assigned[pos];
                 if routes.get(&old).map(|f| f.gen) == Some(ctx.gen) {
@@ -767,13 +788,21 @@ fn honor_requested_addresses(ctx: &SessionCtx, requests: &[RequestedAddress]) {
                 None
             };
             routes.insert(granted, ctx.downstream_flow());
-            old
+            (old, prior)
         };
         if let Some(old) = old_to_free {
             ctx.state.free(old);
         }
         if evicted {
-            log::info!("[server] CONNECT-IP took over {granted} for a reconnecting client (evicted stale session)");
+            // Tell the loser so it renumbers instead of being silently
+            // blackholed. A stale session (dead connection not yet reaped)
+            // never reads the notice — same net effect as before.
+            if let Some(tx) = prior_owner {
+                let _ = tx.send(granted);
+            }
+            log::info!(
+                "[server] CONNECT-IP took over {granted} for a reconnecting client (prior owner notified)"
+            );
         } else {
             log::info!("[server] CONNECT-IP honored requested address {granted}");
         }
@@ -859,6 +888,10 @@ pub async fn handle_ip_request(
         "[server] CONNECT-IP established: stream_id={quic_stream_id} assigned={assigned_ips:?}"
     );
 
+    // Eviction channel: route entries carry the sender; the capsule loop holds
+    // the receiver and renumbers the session when an address is taken over.
+    let (evict_tx, evict_rx) = mpsc::unbounded_channel();
+
     {
         let mut routes = state.routes.write().unwrap();
         for ip in &assigned_ips {
@@ -868,6 +901,7 @@ pub async fn handle_ip_request(
                     conn: conn.clone(),
                     stream_id: quic_stream_id,
                     gen,
+                    evictions: evict_tx.clone(),
                 },
             );
         }
@@ -894,10 +928,11 @@ pub async fn handle_ip_request(
         conn: conn.clone(),
         stream_id: quic_stream_id,
         gen,
+        evict_tx,
     };
     let handle = tokio::spawn(async move {
         let _guard = guard;
-        capsule_loop(recv_half, send_half, ctx).await;
+        capsule_loop(recv_half, send_half, evict_rx, ctx).await;
         let _ = cleanup.send(quic_stream_id).await;
     });
 
@@ -914,38 +949,121 @@ pub async fn handle_ip_request(
 
 /// Capsule loop: reads capsules off the request-stream body and answers
 /// ADDRESS_REQUESTs; the first answered request also triggers the
-/// ROUTE_ADVERTISEMENT and DNS_ASSIGN capsules. Ends on FIN/reset, which
-/// tears the session down.
-async fn capsule_loop(mut recv: H3RecvHalf, mut send: H3SendHalf, ctx: SessionCtx) {
+/// ROUTE_ADVERTISEMENT and DNS_ASSIGN capsules. Also watches the session's
+/// eviction channel, renumbering when another session takes an address over.
+/// Ends on FIN/reset, which tears the session down. (`recv_data` is a poll_fn
+/// over stream-held state, so racing it in select! loses no partial frame.)
+async fn capsule_loop(
+    mut recv: H3RecvHalf,
+    mut send: H3SendHalf,
+    mut evictions: mpsc::UnboundedReceiver<IpAddr>,
+    ctx: SessionCtx,
+) {
     let mut parser = CapsuleParser::default();
     let mut announced = false;
     loop {
-        match recv.recv_data().await {
-            Ok(Some(mut buf)) => {
-                while buf.has_remaining() {
-                    let chunk = buf.chunk();
-                    parser.push(chunk);
-                    let n = chunk.len();
-                    buf.advance(n);
-                }
-                loop {
-                    match parser.next_capsule() {
-                        Ok(Some(capsule)) => {
-                            handle_capsule(&mut send, capsule, &ctx, &mut announced).await
-                        }
-                        Ok(None) => break,
-                        Err(e) => {
-                            log::warn!("[server] Malformed capsule: {e}");
-                            return;
+        tokio::select! {
+            data = recv.recv_data() => match data {
+                Ok(Some(mut buf)) => {
+                    while buf.has_remaining() {
+                        let chunk = buf.chunk();
+                        parser.push(chunk);
+                        let n = chunk.len();
+                        buf.advance(n);
+                    }
+                    loop {
+                        match parser.next_capsule() {
+                            Ok(Some(capsule)) => {
+                                handle_capsule(&mut send, capsule, &ctx, &mut announced).await
+                            }
+                            Ok(None) => break,
+                            Err(e) => {
+                                log::warn!("[server] Malformed capsule: {e}");
+                                return;
+                            }
                         }
                     }
                 }
-            }
-            Ok(None) => break, // FIN: client ended the session
-            Err(e) => {
-                log::debug!("[server] CONNECT-IP stream ended: {e}");
-                break;
-            }
+                Ok(None) => break, // FIN: client ended the session
+                Err(e) => {
+                    log::debug!("[server] CONNECT-IP stream ended: {e}");
+                    break;
+                }
+            },
+            notice = evictions.recv() => match notice {
+                Some(lost) => handle_eviction(&mut send, lost, &ctx, announced).await,
+                // Unreachable: ctx holds a sender for the session's lifetime.
+                None => break,
+            },
+        }
+    }
+}
+
+/// A newer session took `lost` over (its previous owner reconnected and asked
+/// for it back). Renumber this session instead of leaving it silently
+/// blackholed: drop the address from its view, allocate a same-family
+/// replacement when the pool allows — usually the taker's freed provisional
+/// address, making it an address swap — and send a declarative ADDRESS_ASSIGN
+/// with the complete new set (RFC 9484 §4.7.1 lets the proxy re-assign at any
+/// time; the client reconciles its TUN in place).
+async fn handle_eviction(send: &mut H3SendHalf, lost: IpAddr, ctx: &SessionCtx, announced: bool) {
+    {
+        let routes = ctx.state.routes.read().unwrap();
+        let mut assigned = ctx.assigned.lock().unwrap();
+        // Stale notice: the address has come back to this session since (the
+        // client re-requested it and won it back) — nothing was lost.
+        if routes.get(&lost).map(|f| f.gen) == Some(ctx.gen) {
+            return;
+        }
+        let Some(pos) = assigned.iter().position(|a| *a == lost) else {
+            return; // already renumbered
+        };
+        // The taker owns the address (and its pool slot) now: remove it from
+        // this session's view without freeing it, so upstream validation stops
+        // accepting the old source immediately.
+        assigned.remove(pos);
+    }
+    let replacement = ctx.state.alloc(lost.is_ipv6());
+    match replacement {
+        Some(new_ip) => {
+            let mut routes = ctx.state.routes.write().unwrap();
+            let mut assigned = ctx.assigned.lock().unwrap();
+            routes.insert(new_ip, ctx.downstream_flow());
+            assigned.push(new_ip);
+            log::info!("[server] CONNECT-IP session renumbered after takeover: {lost} -> {new_ip}");
+        }
+        None => log::warn!(
+            "[server] CONNECT-IP session lost {lost} to its reconnecting owner; pool exhausted, no replacement"
+        ),
+    }
+    let assigned_now: Vec<IpAddr> = ctx.assigned.lock().unwrap().clone();
+    // Unsolicited assignment: every entry carries Request ID 0 (RFC 9484
+    // §4.7.1). An empty set is a legal withdraw-all when no replacement exists.
+    let out: Vec<AssignedAddress> = assigned_now
+        .iter()
+        .map(|a| AssignedAddress {
+            request_id: 0,
+            addr: *a,
+            prefix_len: max_prefix(*a),
+        })
+        .collect();
+    if send.send_data(encode_address_assign(&out)).await.is_err() {
+        log::warn!("[server] Failed to send takeover ADDRESS_ASSIGN to {assigned_now:?}");
+        return;
+    }
+    // With no replacement the family (or the whole address set) is gone;
+    // refresh the route advertisement so the client withdraws ranges it can no
+    // longer source. A same-family swap leaves the ranges unchanged.
+    if announced && replacement.is_none() {
+        let assigned_pfx: Vec<(IpAddr, u8)> =
+            assigned_now.iter().map(|a| (*a, max_prefix(*a))).collect();
+        let ranges = route_ranges(&ctx.state.advertised_routes, &assigned_pfx);
+        if send
+            .send_data(encode_route_advertisement(&ranges))
+            .await
+            .is_err()
+        {
+            log::warn!("[server] Failed to send post-takeover ROUTE_ADVERTISEMENT");
         }
     }
 }
