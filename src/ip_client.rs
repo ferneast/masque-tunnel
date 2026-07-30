@@ -190,6 +190,11 @@ pub async fn run(config: IpClientConfig) -> Result<(), Box<dyn std::error::Error
     let mut tun: Option<TunBinding> = None;
     let mut routes = crate::route::RouteSet::new();
     let mut dns = crate::dns::DnsGuard::new(config.dns.clone());
+    // The address that carried the last established tunnel. Reconnects dial it
+    // directly when DNS is slow or fails — while the tunnel is down its routes
+    // (and any system-DNS takeover) stay installed, so the resolver itself may
+    // be blackholed behind the dead TUN.
+    let mut last_good: Option<SocketAddr> = None;
 
     enum Step {
         /// Wait this long, then reconnect.
@@ -213,7 +218,7 @@ pub async fn run(config: IpClientConfig) -> Result<(), Box<dyn std::error::Error
             let step = tokio::select! {
                 res = run_tunnel(
                     &config, &client_config, &proxy_host, proxy_port, &sni, &mut tun, &mut routes,
-                    &mut dns, &mut established,
+                    &mut dns, &mut established, &mut last_good,
                 ) => {
                     match res {
                         Ok(TunnelExit::Shutdown) => Step::Shutdown,
@@ -311,6 +316,61 @@ fn build_client_config(
     ));
     client_config.transport_config(Arc::new(transport));
     Ok(client_config)
+}
+
+/// How long a reconnect waits for DNS before falling back to the cached proxy
+/// address. Waiting out the full system-resolver timeout (~30s when the
+/// resolver is blackholed behind the dead TUN) would stall every reconnect.
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Resolve the proxy's candidate addresses. On the first connection this is a
+/// plain DNS lookup and failure fails the attempt. On reconnects (`last_good`
+/// holds the address that carried the previous tunnel) the lookup is bounded
+/// by `RESOLVE_TIMEOUT`, and a timeout, error, or empty answer falls back to
+/// the cached address — so a blackholed or flapping resolver can never strand
+/// a reconnect. A fresh answer is merged behind the cached address, which
+/// stays first so Happy Eyeballs leads with the address known to work.
+async fn resolve_candidates(
+    proxy_host: &str,
+    proxy_port: u16,
+    last_good: Option<SocketAddr>,
+) -> Result<Vec<SocketAddr>, Box<dyn std::error::Error + Send + Sync>> {
+    let lookup = tokio::net::lookup_host((unbracket_host(proxy_host), proxy_port));
+    let Some(cached) = last_good else {
+        let addrs: Vec<SocketAddr> = lookup.await?.collect();
+        if addrs.is_empty() {
+            return Err(format!("DNS resolution failed for {proxy_host}:{proxy_port}").into());
+        }
+        return Ok(addrs);
+    };
+    let resolved = match tokio::time::timeout(RESOLVE_TIMEOUT, lookup).await {
+        Ok(Ok(addrs)) => addrs.collect(),
+        Ok(Err(e)) => {
+            log::warn!("[client] DNS failed for {proxy_host} ({e}); dialing cached {cached}");
+            Vec::new()
+        }
+        Err(_) => {
+            log::warn!(
+                "[client] DNS for {proxy_host} timed out after {}s (resolver may be \
+                 tunneled); dialing cached {cached}",
+                RESOLVE_TIMEOUT.as_secs()
+            );
+            Vec::new()
+        }
+    };
+    Ok(merge_candidates(resolved, cached))
+}
+
+/// The cached known-good address first, then the fresh answers, deduplicated.
+fn merge_candidates(resolved: Vec<SocketAddr>, cached: SocketAddr) -> Vec<SocketAddr> {
+    let mut out = Vec::with_capacity(resolved.len() + 1);
+    out.push(cached);
+    for a in resolved {
+        if !out.contains(&a) {
+            out.push(a);
+        }
+    }
+    out
 }
 
 /// Bind a quinn endpoint for one address family, with the shared client config.
@@ -448,13 +508,14 @@ async fn run_tunnel(
     routes: &mut crate::route::RouteSet,
     dns: &mut crate::dns::DnsGuard,
     established: &mut bool,
+    last_good: &mut Option<SocketAddr>,
 ) -> Result<TunnelExit, Box<dyn std::error::Error + Send + Sync>> {
-    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((unbracket_host(proxy_host), proxy_port))
-        .await?
-        .collect();
-    if addrs.is_empty() {
-        return Err(format!("DNS resolution failed for {proxy_host}:{proxy_port}").into());
-    }
+    let addrs = resolve_candidates(proxy_host, proxy_port, *last_good).await?;
+
+    // Escort every candidate past any split default still installed from the
+    // previous session: an unpinned handshake packet would be routed into the
+    // dead TUN and lost.
+    routes.set_candidates(&addrs.iter().map(|a| a.ip()).collect::<Vec<_>>());
 
     // Per-family endpoints, kept alive for the whole tunnel so the winning
     // connection's socket outlives the Happy Eyeballs race.
@@ -476,6 +537,7 @@ async fn run_tunnel(
         _ = wait_shutdown(config.shutdown.as_ref()) => return Ok(TunnelExit::Shutdown),
     };
     let proxy_ip = winning.ip();
+    *last_good = Some(winning);
     log::info!("[client] QUIC connected to {winning}");
 
     // IP packets ride raw QUIC DATAGRAMs; the h3 layer carries only the
@@ -911,6 +973,23 @@ mod tests {
 
     fn sa(s: &str) -> SocketAddr {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn merge_candidates_keeps_cached_first_and_dedups() {
+        let resolved = vec![sa("10.0.0.1:443"), sa("10.0.0.2:443"), sa("10.0.0.1:443")];
+        assert_eq!(
+            merge_candidates(resolved, sa("10.0.0.2:443")),
+            vec![sa("10.0.0.2:443"), sa("10.0.0.1:443")]
+        );
+    }
+
+    #[test]
+    fn merge_candidates_empty_answer_falls_back_to_cached() {
+        assert_eq!(
+            merge_candidates(Vec::new(), sa("10.0.0.9:443")),
+            vec![sa("10.0.0.9:443")]
+        );
     }
 
     #[test]

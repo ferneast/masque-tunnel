@@ -9,9 +9,11 @@
 //!   * **Default routes** (`0.0.0.0/0`, `::/0`) mean full-tunnel. Taking those
 //!     over is only done when the operator opts in with `--redirect-gateway`,
 //!     because it reroutes *all* traffic. We then:
-//!       1. pin the proxy server's own address to the original gateway, so the
-//!          encrypted QUIC packets keep flowing over the real link instead of
-//!          recursing into the tunnel, and
+//!       1. pin every candidate proxy address (all DNS answers, not just the
+//!          connected one) to the original gateway, so the encrypted QUIC
+//!          packets keep flowing over the real link instead of recursing into
+//!          the tunnel — including the handshake of a later reconnect, which
+//!          may land on a different answer or address family, and
 //!       2. install a split default (`0.0.0.0/1` + `128.0.0.0/1`, and the v6
 //!          equivalents `::/1` + `8000::/1`) toward the TUN. A split default
 //!          out-prioritizes the real default without deleting it, so rollback
@@ -25,7 +27,7 @@
 //! and resolve through the proxy (no leak); a LAN resolver would become
 //! unreachable. We do not rewrite the system resolver here.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -49,9 +51,14 @@ pub struct RouteSet {
     direct: HashSet<(IpAddr, u8)>,
     /// The TUN device name those routes point at.
     tun: String,
-    /// The proxy-address pin (dst, gateway, interface), present while a default
-    /// route is being redirected.
-    pin: Option<(IpAddr, IpAddr, String)>,
+    /// Proxy-address pins (dst → (gateway, interface)), present while a default
+    /// route is being redirected. Every candidate proxy address is pinned, not
+    /// just the connected one, so a reconnect handshake to any of them escapes
+    /// the split default.
+    pins: HashMap<IpAddr, (IpAddr, String)>,
+    /// Proxy addresses of the current connection attempt — the pin set to
+    /// maintain while a redirect is in effect.
+    candidates: Vec<IpAddr>,
 }
 
 impl RouteSet {
@@ -60,7 +67,71 @@ impl RouteSet {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.direct.is_empty() && self.pin.is_none()
+        self.direct.is_empty() && self.pins.is_empty()
+    }
+
+    /// Record the proxy addresses about to be dialed and, when a redirected
+    /// default from a previous session is still installed, pin them to the
+    /// physical gateway before the handshake. Without this, a reconnect whose
+    /// DNS answer moved (or switched address family) would route its own
+    /// handshake into the dead TUN. Pins for former candidates are removed.
+    /// With no redirect in effect this only records the set — `reconcile`
+    /// installs the pins if the session later takes over the default route.
+    pub fn set_candidates(&mut self, addrs: &[IpAddr]) {
+        self.candidates = addrs.to_vec();
+        if self.pins.is_empty() {
+            return; // no redirect in effect; nothing to escape from
+        }
+        let stale: Vec<IpAddr> = self
+            .pins
+            .keys()
+            .filter(|ip| !self.candidates.contains(ip))
+            .copied()
+            .collect();
+        for ip in stale {
+            self.unpin(ip);
+        }
+        self.pin_all_candidates();
+    }
+
+    /// Pin every candidate, best-effort: a family without a default gateway
+    /// (e.g. no IPv6 uplink) leaves that candidate unpinned — it was
+    /// unreachable outside the tunnel anyway.
+    fn pin_all_candidates(&mut self) {
+        for ip in self.candidates.clone() {
+            if let Err(e) = self.ensure_pin(ip) {
+                log::warn!("[client] failed to pin proxy candidate {ip}: {e}");
+            }
+        }
+    }
+
+    /// Pin `dst` to the current physical default gateway (idempotent).
+    fn ensure_pin(&mut self, dst: IpAddr) -> io::Result<()> {
+        if self.pins.contains_key(&dst) {
+            return Ok(());
+        }
+        let gw = default_gateway(dst.is_ipv6()).ok_or_else(|| {
+            io::Error::other(format!("no default gateway found to pin proxy address {dst}"))
+        })?;
+        route_add_pinned(dst, gw.addr, &gw.interface)?;
+        log::info!(
+            "[client] pinned proxy {dst} to gateway {} dev {}",
+            gw.addr,
+            gw.interface
+        );
+        self.pins.insert(dst, (gw.addr, gw.interface));
+        Ok(())
+    }
+
+    fn unpin(&mut self, dst: IpAddr) {
+        let Some((gw, interface)) = self.pins.remove(&dst) else {
+            return;
+        };
+        if let Err(e) = route_del_pinned(dst, gw, &interface) {
+            log::warn!("[client] failed to remove proxy pin {dst}: {e}");
+        } else {
+            log::info!("[client] removed proxy pin {dst}");
+        }
     }
 
     /// True if `ip` falls within any installed direct route (i.e. it would be
@@ -74,8 +145,9 @@ impl RouteSet {
     /// Reconcile installed routes with `ranges` (the complete advertised set).
     /// Newly advertised ranges are installed; ranges no longer present are
     /// withdrawn (declarative supersede). A default range is taken over only
-    /// when `redirect_gateway` is set, pinning the proxy address first so the
-    /// underlying QUIC connection is never routed into the tunnel it carries.
+    /// when `redirect_gateway` is set, pinning the proxy candidates first so
+    /// the underlying QUIC connection is never routed into the tunnel it
+    /// carries.
     pub fn reconcile(
         &mut self,
         ranges: &[crate::capsule::IpAddressRange],
@@ -94,18 +166,13 @@ impl RouteSet {
         // Desired direct-route set derived from the advertisement (declarative).
         let (desired, redirect) = desired_routes(ranges, redirect_gateway);
 
-        // Pin the proxy before installing any split default.
-        if redirect && self.pin.is_none() {
-            let gw = default_gateway(proxy_ip.is_ipv6()).ok_or_else(|| {
-                io::Error::other("no default gateway found to pin the proxy address against")
-            })?;
-            route_add_pinned(proxy_ip, gw.addr, &gw.interface)?;
-            log::info!(
-                "[client] pinned proxy {proxy_ip} to gateway {} dev {}",
-                gw.addr,
-                gw.interface
-            );
-            self.pin = Some((proxy_ip, gw.addr, gw.interface));
+        // Pin the proxy candidates before installing any split default. The
+        // live connection's address must escape the redirect or the tunnel
+        // would swallow its own transport (hard error); the remaining
+        // candidates are pinned best-effort for later reconnect handshakes.
+        if redirect {
+            self.ensure_pin(proxy_ip)?;
+            self.pin_all_candidates();
         }
 
         // Install newly advertised routes.
@@ -132,14 +199,10 @@ impl RouteSet {
             }
         }
 
-        // Remove the proxy pin only after the split default is gone.
+        // Remove the proxy pins only after the split default is gone.
         if !redirect {
-            if let Some((dst, gw, interface)) = self.pin.take() {
-                if let Err(e) = route_del_pinned(dst, gw, &interface) {
-                    log::warn!("[client] failed to remove proxy pin {dst}: {e}");
-                } else {
-                    log::info!("[client] removed proxy pin {dst}");
-                }
+            for dst in self.pins.keys().copied().collect::<Vec<_>>() {
+                self.unpin(dst);
             }
         }
 
@@ -154,10 +217,8 @@ impl RouteSet {
                 log::warn!("[client] failed to remove route {dst}/{prefix}: {e}");
             }
         }
-        if let Some((dst, gw, interface)) = self.pin.take() {
-            if let Err(e) = route_del_pinned(dst, gw, &interface) {
-                log::warn!("[client] failed to remove proxy pin {dst}: {e}");
-            }
+        for dst in self.pins.keys().copied().collect::<Vec<_>>() {
+            self.unpin(dst);
         }
     }
 }
