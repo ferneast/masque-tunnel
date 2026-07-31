@@ -204,11 +204,15 @@ pub async fn run(config: IpClientConfig) -> Result<(), Box<dyn std::error::Error
     let mut tun: Option<TunBinding> = None;
     let mut routes = crate::route::RouteSet::new();
     let mut dns = crate::dns::DnsGuard::new(config.dns.clone());
-    // The address that carried the last established tunnel. Reconnects dial it
-    // directly when DNS is slow or fails — while the tunnel is down its routes
-    // (and any system-DNS takeover) stay installed, so the resolver itself may
-    // be blackholed behind the dead TUN.
-    let mut last_good: Option<SocketAddr> = None;
+    // Proxy addresses remembered from the last established tunnel: the whole
+    // answer that attempt resolved, with the address that actually carried the
+    // tunnel first. Reconnects fall back to these when DNS is slow or fails —
+    // while the tunnel is down its routes (and any system-DNS takeover, on iOS
+    // the proxy-pushed resolver) stay installed, so the resolver itself may be
+    // blackholed behind the dead TUN. Remembering the whole answer rather than
+    // just the winner is what lets a reconnect onto a network without IPv6 fall
+    // back to the A record while the resolver is unreachable.
+    let mut cached: Vec<SocketAddr> = Vec::new();
 
     enum Step {
         /// Wait this long, then reconnect.
@@ -234,7 +238,7 @@ pub async fn run(config: IpClientConfig) -> Result<(), Box<dyn std::error::Error
             let step = tokio::select! {
                 res = run_tunnel(
                     &config, &client_config, &proxy_host, proxy_port, &sni, &mut tun, &mut routes,
-                    &mut dns, &mut established, &mut last_good,
+                    &mut dns, &mut established, &mut cached,
                 ) => {
                     match res {
                         Ok(TunnelExit::Shutdown) => Step::Shutdown,
@@ -360,36 +364,40 @@ fn build_client_config(
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Resolve the proxy's candidate addresses. On the first connection this is a
-/// plain DNS lookup and failure fails the attempt. On reconnects (`last_good`
-/// holds the address that carried the previous tunnel) the lookup is bounded
-/// by `RESOLVE_TIMEOUT`, and a timeout, error, or empty answer falls back to
-/// the cached address — so a blackholed or flapping resolver can never strand
-/// a reconnect. A fresh answer is merged behind the cached address, which
-/// stays first so Happy Eyeballs leads with the address known to work.
+/// plain DNS lookup and failure fails the attempt. On reconnects (`cached`
+/// holds the addresses the previous tunnel resolved) the lookup is bounded by
+/// `RESOLVE_TIMEOUT`, and a timeout, error, or empty answer falls back to the
+/// cached set — so a blackholed or flapping resolver can never strand a
+/// reconnect. A fresh answer keeps its own order and the cached addresses trail
+/// it (see `merge_candidates`).
 async fn resolve_candidates(
     proxy_host: &str,
     proxy_port: u16,
-    last_good: Option<SocketAddr>,
+    cached: &[SocketAddr],
 ) -> Result<Vec<SocketAddr>, Box<dyn std::error::Error + Send + Sync>> {
     let lookup = tokio::net::lookup_host((unbracket_host(proxy_host), proxy_port));
-    let Some(cached) = last_good else {
+    if cached.is_empty() {
         let addrs: Vec<SocketAddr> = lookup.await?.collect();
         if addrs.is_empty() {
             return Err(format!("DNS resolution failed for {proxy_host}:{proxy_port}").into());
         }
         return Ok(addrs);
-    };
+    }
     let resolved = match tokio::time::timeout(RESOLVE_TIMEOUT, lookup).await {
         Ok(Ok(addrs)) => addrs.collect(),
         Ok(Err(e)) => {
-            log::warn!("[client] DNS failed for {proxy_host} ({e}); dialing cached {cached}");
+            log::warn!(
+                "[client] DNS failed for {proxy_host} ({e}); dialing {} cached address(es)",
+                cached.len()
+            );
             Vec::new()
         }
         Err(_) => {
             log::warn!(
                 "[client] DNS for {proxy_host} timed out after {}s (resolver may be \
-                 tunneled); dialing cached {cached}",
-                RESOLVE_TIMEOUT.as_secs()
+                 tunneled); dialing {} cached address(es)",
+                RESOLVE_TIMEOUT.as_secs(),
+                cached.len()
             );
             Vec::new()
         }
@@ -397,16 +405,33 @@ async fn resolve_candidates(
     Ok(merge_candidates(resolved, cached))
 }
 
-/// The cached known-good address first, then the fresh answers, deduplicated.
-fn merge_candidates(resolved: Vec<SocketAddr>, cached: SocketAddr) -> Vec<SocketAddr> {
-    let mut out = Vec::with_capacity(resolved.len() + 1);
-    out.push(cached);
-    for a in resolved {
+/// The fresh answers in the resolver's own order, then any cached address not
+/// already among them, deduplicated.
+///
+/// The cache trails rather than leads: `getaddrinfo` ranks and filters by the
+/// families the current path actually carries (RFC 6724), so right after a
+/// network change it — not the cache — is the side that knows the IPv6 address
+/// which carried the last session has no route on this Wi-Fi. Leading with the
+/// cache there would put a dead address at the head of the Happy Eyeballs order
+/// on every attempt. When the answer is empty (a resolver blackholed behind the
+/// still-installed tunnel routes) the cache is all there is, and its own order
+/// — last winner first — decides who is tried first.
+fn merge_candidates(resolved: Vec<SocketAddr>, cached: &[SocketAddr]) -> Vec<SocketAddr> {
+    let mut out = Vec::with_capacity(resolved.len() + cached.len());
+    for a in resolved.into_iter().chain(cached.iter().copied()) {
         if !out.contains(&a) {
             out.push(a);
         }
     }
     out
+}
+
+/// The addresses an attempt raced, reordered with its winner first, to seed the
+/// next reconnect's fallback set.
+fn promote_winner(mut addrs: Vec<SocketAddr>, winner: SocketAddr) -> Vec<SocketAddr> {
+    addrs.retain(|a| *a != winner);
+    addrs.insert(0, winner);
+    addrs
 }
 
 /// Bind a quinn endpoint for one address family, with the shared client config.
@@ -417,6 +442,63 @@ fn make_endpoint(
     let mut ep = quinn::Endpoint::client(bind.parse()?)?;
     ep.set_default_client_config(client_config.clone());
     Ok(ep)
+}
+
+/// Bound one candidate's handshake. quinn has no handshake timeout of its own,
+/// so a candidate whose address has no route on the current path — a stale IPv6
+/// address after a switch to a v4-only Wi-Fi, where every send fails locally
+/// with `EHOSTUNREACH` — would otherwise sit there until the 30s idle timeout.
+/// With another candidate in the race that only wastes a socket, but when the
+/// resolver is down and the cached address is the only candidate, it is the
+/// whole reconnect.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// One Happy Eyeballs attempt: hand back the connection only once its handshake
+/// completes, which takes hearing from the server and so proves the path works.
+///
+/// `into_0rtt` hands back a usable connection before a single packet has been
+/// acknowledged. Declaring that the winner would make whichever candidate is
+/// tried first win unconditionally and turn the race into a no-op — the failure
+/// that strands a reconnect on a cached IPv6 address after a switch to a
+/// network with no IPv6 route, then reports it 30 seconds later as a spurious
+/// "0-RTT rejected". Session resumption still applies; only the early-data
+/// window is given up, and on this stack the CONNECT-IP response lands in the
+/// same round trip either way.
+async fn dial(
+    ep: quinn::Endpoint,
+    addr: SocketAddr,
+    sni: String,
+) -> Result<(quinn::Connection, SocketAddr), Box<dyn std::error::Error + Send + Sync>> {
+    let timed_out = || {
+        format!(
+            "{addr}: handshake timed out after {}s",
+            HANDSHAKE_TIMEOUT.as_secs()
+        )
+    };
+    let conn = match ep.connect(addr, &sni)?.into_0rtt() {
+        Ok((conn, accepted)) => {
+            log::debug!("[client] resuming with 0-RTT to {addr}");
+            match tokio::time::timeout(HANDSHAKE_TIMEOUT, accepted).await {
+                Ok(true) => log::info!("[client] 0-RTT accepted by {addr}"),
+                // `accepted` also resolves false when the connection dies before
+                // completing, so only a connection still live here means the
+                // server genuinely declined the ticket and fell back to 1-RTT.
+                Ok(false) => match conn.close_reason() {
+                    Some(reason) => return Err(format!("{addr}: {reason}").into()),
+                    None => log::info!("[client] 0-RTT declined by {addr}, using 1-RTT"),
+                },
+                Err(_) => {
+                    conn.close(0u32.into(), b"handshake timeout");
+                    return Err(timed_out().into());
+                }
+            }
+            conn
+        }
+        Err(connecting) => tokio::time::timeout(HANDSHAKE_TIMEOUT, connecting)
+            .await
+            .map_err(|_| timed_out())??,
+    };
+    Ok((conn, addr))
 }
 
 /// Happy Eyeballs (RFC 8305): interleave address families and start a handshake
@@ -447,31 +529,7 @@ async fn establish_connection(
                 Some(addr) => {
                     let ep = if addr.is_ipv4() { ep_v4 } else { ep_v6 };
                     if let Some(ep) = ep {
-                        let ep = ep.clone();
-                        let sni = sni.to_string();
-                        running.push(async move {
-                            let connecting = ep.connect(addr, &sni)?;
-                            // Resume with 0-RTT when a cached ticket lets us;
-                            // otherwise complete the full handshake. Only the
-                            // replay-safe CONNECT-IP request rides as early data
-                            // — IP datagrams wait for the post-handshake address
-                            // assignment.
-                            let conn = match connecting.into_0rtt() {
-                                Ok((conn, accepted)) => {
-                                    log::info!("[client] resuming with 0-RTT to {addr}");
-                                    tokio::spawn(async move {
-                                        if accepted.await {
-                                            log::info!("[client] 0-RTT accepted by server");
-                                        } else {
-                                            log::info!("[client] 0-RTT rejected, fell back to 1-RTT");
-                                        }
-                                    });
-                                    conn
-                                }
-                                Err(connecting) => connecting.await?,
-                            };
-                            Ok::<_, Box<dyn std::error::Error + Send + Sync>>((conn, addr))
-                        });
+                        running.push(dial(ep.clone(), addr, sni.to_string()));
                     }
                     next_at = tokio::time::Instant::now() + ATTEMPT_DELAY;
                 }
@@ -544,9 +602,9 @@ async fn run_tunnel(
     routes: &mut crate::route::RouteSet,
     dns: &mut crate::dns::DnsGuard,
     established: &mut bool,
-    last_good: &mut Option<SocketAddr>,
+    cached: &mut Vec<SocketAddr>,
 ) -> Result<TunnelExit, Box<dyn std::error::Error + Send + Sync>> {
-    let addrs = resolve_candidates(proxy_host, proxy_port, *last_good).await?;
+    let addrs = resolve_candidates(proxy_host, proxy_port, cached).await?;
 
     // Escort every candidate past any split default still installed from the
     // previous session: an unpinned handshake packet would be routed into the
@@ -569,11 +627,11 @@ async fn run_tunnel(
     // A shutdown during the handshake needs no graceful close (no address is
     // assigned yet); just stop, dropping the in-flight connect attempts.
     let (conn, winning) = tokio::select! {
-        r = establish_connection(addrs, sni, ep_v4.as_ref(), ep_v6.as_ref()) => r?,
+        r = establish_connection(addrs.clone(), sni, ep_v4.as_ref(), ep_v6.as_ref()) => r?,
         _ = wait_shutdown(config.shutdown.as_ref()) => return Ok(TunnelExit::Shutdown),
     };
     let proxy_ip = winning.ip();
-    *last_good = Some(winning);
+    *cached = promote_winner(addrs, winning);
     log::info!("[client] QUIC connected to {winning}");
 
     // IP packets ride raw QUIC DATAGRAMs; the h3 layer carries only the
@@ -1012,19 +1070,47 @@ mod tests {
     }
 
     #[test]
-    fn merge_candidates_keeps_cached_first_and_dedups() {
+    fn merge_candidates_keeps_resolver_order_and_dedups() {
         let resolved = vec![sa("10.0.0.1:443"), sa("10.0.0.2:443"), sa("10.0.0.1:443")];
         assert_eq!(
-            merge_candidates(resolved, sa("10.0.0.2:443")),
-            vec![sa("10.0.0.2:443"), sa("10.0.0.1:443")]
+            merge_candidates(resolved, &[sa("10.0.0.2:443")]),
+            vec![sa("10.0.0.1:443"), sa("10.0.0.2:443")]
         );
     }
 
     #[test]
-    fn merge_candidates_empty_answer_falls_back_to_cached() {
+    fn merge_candidates_appends_cached_as_last_resort() {
+        // The resolver dropped the AAAA record because this path has no IPv6:
+        // the address that carried the last session must not lead the order.
         assert_eq!(
-            merge_candidates(Vec::new(), sa("10.0.0.9:443")),
-            vec![sa("10.0.0.9:443")]
+            merge_candidates(vec![sa("10.0.0.1:443")], &[sa("[2001:db8::1]:443")]),
+            vec![sa("10.0.0.1:443"), sa("[2001:db8::1]:443")]
+        );
+    }
+
+    #[test]
+    fn merge_candidates_empty_answer_keeps_whole_cached_set() {
+        // A blackholed resolver leaves only the cache — which must still carry
+        // the other family, or a reconnect onto a v4-only path has nothing to
+        // fall back to.
+        let cached = [sa("[2001:db8::1]:443"), sa("10.0.0.9:443")];
+        assert_eq!(merge_candidates(Vec::new(), &cached), cached.to_vec());
+    }
+
+    #[test]
+    fn promote_winner_moves_the_winner_to_the_front() {
+        let addrs = vec![sa("10.0.0.1:443"), sa("[2001:db8::1]:443"), sa("10.0.0.2:443")];
+        assert_eq!(
+            promote_winner(addrs, sa("10.0.0.2:443")),
+            vec![sa("10.0.0.2:443"), sa("10.0.0.1:443"), sa("[2001:db8::1]:443")]
+        );
+    }
+
+    #[test]
+    fn promote_winner_adds_a_winner_absent_from_the_list() {
+        assert_eq!(
+            promote_winner(vec![sa("10.0.0.1:443")], sa("10.0.0.2:443")),
+            vec![sa("10.0.0.2:443"), sa("10.0.0.1:443")]
         );
     }
 
