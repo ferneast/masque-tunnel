@@ -1,6 +1,6 @@
 [package]
 name = "masque-tunnel"
-version = "0.16.1"
+version = "0.17.0"
 edition = "2021"
 description = "MASQUE tunnel on quinn+h3: CONNECT-UDP (RFC 9298) and CONNECT-IP (RFC 9484)"
 

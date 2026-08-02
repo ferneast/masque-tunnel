@@ -103,6 +103,7 @@ Commands:
 | `--proxy-url` | `-p` | MASQUE proxy server URL | required |
 | `--sni` | | TLS SNI override | none |
 | `--auth-token` | | Bearer token for authentication | none |
+| `--header` | | Extra `Name: Value` header on the CONNECT-IP request, repeatable; the first of a name replaces the built-in header of that name (`--auth-token`'s included), repeats are appended | none |
 | `--ca` | | CA certificate PEM to verify the server | system roots |
 | `--insecure` | | Skip server certificate verification | off |
 | `--mtu` | | TUN device MTU (must fit a QUIC DATAGRAM) | `1280` |

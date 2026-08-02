@@ -180,8 +180,13 @@ unsafe fn cstr(p: *const c_char) -> Option<String> {
 }
 
 /// Start the CONNECT-IP client against `proxy_url`, forwarding over `tun_fd`
-/// (a dup of the provider's utun fd). `auth_token`, `sni`, and
-/// `preferred_addresses` may be null; `mtu` 0 selects the default (1280).
+/// (a dup of the provider's utun fd). `auth_token`, `extra_headers`, `sni`,
+/// and `preferred_addresses` may be null; `mtu` 0 selects the default (1280).
+/// `extra_headers` carries operator-supplied request headers, one `Name: Value`
+/// per line, for proxies that gate access on something other than the Bearer
+/// token; the first entry of a name replaces the header the client would have
+/// sent under it (`proxy-authorization` included) and repeats are appended.
+/// Malformed lines are skipped with a warning.
 /// `preferred_addresses` is a comma-separated list of IP literals (e.g.
 /// `"10.99.0.2,2001:db8::2"`) preferred on a cold start, before any address is
 /// assigned, so the proxy can hand back a stable IP; the first entry of each
@@ -194,12 +199,13 @@ unsafe fn cstr(p: *const c_char) -> Option<String> {
 ///
 /// # Safety
 /// `proxy_url` must be a valid NUL-terminated UTF-8 string; `auth_token`,
-/// `sni`, and `preferred_addresses` the same or null. `callbacks` pointers must
-/// remain valid until stop.
+/// `extra_headers`, `sni`, and `preferred_addresses` the same or null.
+/// `callbacks` pointers must remain valid until stop.
 #[no_mangle]
 pub unsafe extern "C" fn masque_client_ip_start(
     proxy_url: *const c_char,
     auth_token: *const c_char,
+    extra_headers: *const c_char,
     sni: *const c_char,
     preferred_addresses: *const c_char,
     insecure: bool,
@@ -212,6 +218,9 @@ pub unsafe extern "C" fn masque_client_ip_start(
         return std::ptr::null_mut();
     };
     let auth_token = cstr(auth_token);
+    let extra_headers = cstr(extra_headers)
+        .map(|s| ip_client::parse_extra_headers(&s))
+        .unwrap_or_default();
     let sni = cstr(sni);
     let preferred_addresses: Vec<IpAddr> = cstr(preferred_addresses)
         .map(|s| {
@@ -237,6 +246,7 @@ pub unsafe extern "C" fn masque_client_ip_start(
         proxy_url,
         sni,
         auth_token,
+        extra_headers,
         insecure,
         ca: None,
         mtu: if mtu == 0 { 1280 } else { mtu },

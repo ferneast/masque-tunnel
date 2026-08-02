@@ -26,6 +26,16 @@ pub struct IpClientConfig {
     pub proxy_url: String,
     pub sni: Option<String>,
     pub auth_token: Option<String>,
+    /// Extra HTTP headers to put on the CONNECT-IP request, in operator order.
+    /// A self-hosted proxy — or a reverse proxy, CDN, or WAF in front of one —
+    /// may gate access on something other than the Bearer token this client
+    /// derives from `auth_token`. Applied after the built-in headers, so the
+    /// first entry of a given name replaces what the client would otherwise
+    /// send under that name (`proxy-authorization` included) and later entries
+    /// of the same name are appended, which is how HTTP expresses a
+    /// multi-valued field. Syntactically invalid names or values are dropped
+    /// with a warning instead of failing the connect.
+    pub extra_headers: Vec<(String, String)>,
     pub insecure: bool,
     pub ca: Option<String>,
     /// MTU for the TUN device. Must not exceed what a QUIC DATAGRAM on the
@@ -660,6 +670,7 @@ async fn run_tunnel(
     if let Some(token) = &config.auth_token {
         req_builder = req_builder.header("proxy-authorization", format!("Bearer {token}"));
     }
+    req_builder = apply_extra_headers(req_builder, &config.extra_headers);
     let req = req_builder.extension(protocol).body(())?;
 
     let mut stream = send_request.send_request(req).await?;
@@ -1052,6 +1063,63 @@ fn apply_address_assign(
     Ok(())
 }
 
+/// Parse operator-supplied request headers written one per line as
+/// `Name: Value` (the wire form). The split is on the *first* colon, so a
+/// value may contain colons (`Host: example.com:8443`); surrounding optional
+/// whitespace is stripped per RFC 9110 §5.5. Blank lines are ignored and a
+/// line without a colon is dropped with a warning — a malformed entry must not
+/// take the tunnel down. Names/values are validated later, where they are
+/// applied, so both the CLI and the FFI share one rule set.
+pub fn parse_extra_headers(raw: &str) -> Vec<(String, String)> {
+    raw.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter_map(|line| match line.split_once(':') {
+            Some((name, value)) => Some((name.trim().to_string(), value.trim().to_string())),
+            None => {
+                log::warn!("[client] ignoring header without a colon: {line}");
+                None
+            }
+        })
+        .collect()
+}
+
+/// Put `headers` on `builder`, letting the operator override what the client
+/// already set. `Builder::header` appends, so a custom `proxy-authorization`
+/// would otherwise ride along *next to* the token-derived one; insert the
+/// first occurrence of each name (replacing any built-in value) and append
+/// only the repeats, which preserves a deliberately multi-valued field.
+fn apply_extra_headers(
+    mut builder: http::request::Builder,
+    headers: &[(String, String)],
+) -> http::request::Builder {
+    if headers.is_empty() {
+        return builder;
+    }
+    // None once the builder is already in an error state; nothing to add to.
+    let Some(map) = builder.headers_mut() else {
+        return builder;
+    };
+    let mut seen: std::collections::HashSet<http::header::HeaderName> =
+        std::collections::HashSet::new();
+    for (name, value) in headers {
+        let Ok(name) = http::header::HeaderName::from_bytes(name.as_bytes()) else {
+            log::warn!("[client] ignoring header with an invalid name: {name}");
+            continue;
+        };
+        let Ok(value) = http::header::HeaderValue::from_str(value) else {
+            log::warn!("[client] ignoring invalid value for header {name}");
+            continue;
+        };
+        if seen.insert(name.clone()) {
+            map.insert(name, value);
+        } else {
+            map.append(name, value);
+        }
+    }
+    builder
+}
+
 /// Render an assignment set like `10.99.0.2/32, 2001:db8:1::2/128`.
 fn fmt_addrs(addrs: &[(IpAddr, u8)]) -> String {
     addrs
@@ -1188,5 +1256,91 @@ mod tests {
             request_address(None, None, IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
             IpAddr::V4(Ipv4Addr::UNSPECIFIED)
         );
+    }
+
+    #[test]
+    fn extra_headers_parse_one_per_line_splitting_on_the_first_colon() {
+        let parsed = parse_extra_headers(
+            "X-Auth-Key: abc123\n  X-Client-Id:iphone-01  \n\nHost: example.com:8443\n",
+        );
+        assert_eq!(
+            parsed,
+            vec![
+                ("X-Auth-Key".to_string(), "abc123".to_string()),
+                ("X-Client-Id".to_string(), "iphone-01".to_string()),
+                ("Host".to_string(), "example.com:8443".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn extra_headers_drop_lines_without_a_colon() {
+        assert_eq!(
+            parse_extra_headers("not-a-header\nX-Ok: 1"),
+            vec![("X-Ok".to_string(), "1".to_string())]
+        );
+        assert!(parse_extra_headers("").is_empty());
+    }
+
+    fn header_values(builder: &http::request::Builder, name: &str) -> Vec<String> {
+        builder
+            .headers_ref()
+            .unwrap()
+            .get_all(name)
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn first_custom_header_replaces_the_built_in_one() {
+        // The operator's proxy-authorization must be the only one on the wire:
+        // sending both the token-derived value and the override is what the
+        // plain `Builder::header` append would do, and proxies reject that.
+        let builder = http::Request::builder()
+            .method("CONNECT")
+            .header("capsule-protocol", "?1")
+            .header("proxy-authorization", "Bearer from-token");
+        let builder = apply_extra_headers(
+            builder,
+            &[("proxy-authorization".into(), "Custom scheme=1".into())],
+        );
+        assert_eq!(
+            header_values(&builder, "proxy-authorization"),
+            vec!["Custom scheme=1".to_string()]
+        );
+        assert_eq!(header_values(&builder, "capsule-protocol"), vec!["?1"]);
+    }
+
+    #[test]
+    fn repeated_custom_names_accumulate() {
+        let builder = apply_extra_headers(
+            http::Request::builder().method("CONNECT"),
+            &[
+                ("x-tag".into(), "a".into()),
+                ("x-tag".into(), "b".into()),
+                ("x-other".into(), "c".into()),
+            ],
+        );
+        assert_eq!(header_values(&builder, "x-tag"), vec!["a", "b"]);
+        assert_eq!(header_values(&builder, "x-other"), vec!["c"]);
+    }
+
+    #[test]
+    fn malformed_headers_are_skipped_not_fatal() {
+        // A bad entry must not poison the builder: `Builder::header` records
+        // the error and every later call is a no-op, so the whole connect
+        // would fail on one typo.
+        let builder = apply_extra_headers(
+            http::Request::builder().method("CONNECT"),
+            &[
+                ("bad name".into(), "v".into()),
+                ("x-bad-value".into(), "line\nbreak".into()),
+                ("x-good".into(), "v".into()),
+            ],
+        );
+        assert!(builder.headers_ref().unwrap().get("bad name").is_none());
+        assert!(builder.headers_ref().unwrap().get("x-bad-value").is_none());
+        assert_eq!(header_values(&builder, "x-good"), vec!["v"]);
     }
 }

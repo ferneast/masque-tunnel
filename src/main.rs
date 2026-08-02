@@ -82,6 +82,15 @@ enum Commands {
         #[arg(long)]
         auth_token: Option<String>,
 
+        /// Extra header to send on the CONNECT-IP request, written as
+        /// "Name: Value" and repeatable, for proxies that gate access on their
+        /// own headers rather than a Bearer token. The first --header of a
+        /// given name replaces the header the client would otherwise send
+        /// under it (including --auth-token's Proxy-Authorization); repeats of
+        /// the same name are appended.
+        #[arg(long = "header", value_name = "NAME: VALUE")]
+        headers: Vec<String>,
+
         /// CA certificate PEM file for server verification
         #[arg(long)]
         ca: Option<String>,
@@ -232,6 +241,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             proxy_url,
             sni,
             auth_token,
+            headers,
             ca,
             insecure,
             mtu,
@@ -244,6 +254,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 proxy_url,
                 sni,
                 auth_token,
+                extra_headers: ip_client::parse_extra_headers(&headers.join("\n")),
                 insecure,
                 ca,
                 mtu,

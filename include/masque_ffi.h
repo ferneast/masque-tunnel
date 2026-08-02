@@ -50,6 +50,14 @@ typedef struct {
 // on_state(2, detail).
 //   proxy_url:  MASQUE proxy URL, e.g. "https://relay.example.com" (required)
 //   auth_token: Bearer token for proxy authorization (NULL = none)
+//   extra_headers: operator-supplied headers for the CONNECT-IP request, one
+//               "Name: Value" per line (NULL/empty = none), for proxies that
+//               gate access on their own headers rather than a Bearer token.
+//               The first entry of a given name replaces the header the client
+//               would otherwise send under it (the auth_token-derived
+//               proxy-authorization included); repeats of the same name are
+//               appended. Lines without a colon, and names or values that are
+//               not valid HTTP, are skipped with a warning.
 //   sni:        TLS SNI override for domain fronting (NULL = host of proxy_url)
 //   preferred_addresses: comma-separated preferred tunnel IPs to request on a
 //               cold start, before any address is assigned, e.g.
@@ -66,6 +74,7 @@ typedef struct {
 // Returns an opaque handle, or NULL on invalid input.
 MasqueHandle *masque_client_ip_start(const char *proxy_url,
                                      const char *auth_token,
+                                     const char *extra_headers,
                                      const char *sni,
                                      const char *preferred_addresses,
                                      bool insecure,
