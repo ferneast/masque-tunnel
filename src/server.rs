@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use h3::ext::Protocol;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
@@ -197,27 +198,47 @@ async fn handle_connection(
     let mut sessions: HashMap<u64, Session> = HashMap::new();
     let (cleanup_tx, mut cleanup_rx) = mpsc::channel::<u64>(64);
 
+    // Header resolution runs concurrently, never inline in the select arm.
+    // A `RequestResolver` is self-contained (it owns its frame stream and only
+    // shares state through an Arc), so awaiting it here would block *every*
+    // other arm — including datagram forwarding — until that one client sends
+    // its HEADERS. RFC 9114 does not require a client to send HEADERS promptly
+    // after opening a bidi stream, and at least one does not: Network.framework
+    // opens a client bidi stream 0 that never carries any, which wedged this
+    // loop permanently and made the connection look dead.
+    //
+    // Deliberately no timeout on a pending resolution: QUIC's
+    // max_concurrent_bidi_streams already bounds how many can be outstanding,
+    // and streams that never resolve are dropped when the connection ends.
+    let mut pending_requests = FuturesUnordered::new();
+
     loop {
         tokio::select! {
             // Accept new H3 requests (also drives the H3 connection)
             result = h3.accept() => {
                 match result {
                     Ok(Some(resolver)) => {
-                        match resolver.resolve_request().await {
-                            Ok((req, stream)) => {
-                                handle_request(
-                                    req, stream, &mut sessions, &state,
-                                    &dgram_conn, &cleanup_tx,
-                                ).await;
-                            }
-                            Err(e) => log::error!("[server] Request resolve error: {e}"),
-                        }
+                        pending_requests.push(resolver.resolve_request());
+                        log::trace!("[server] Pending header resolutions: {}", pending_requests.len());
                     }
                     Ok(None) => break,
                     Err(e) => {
                         log::error!("[server] H3 error: {e}");
                         break;
                     }
+                }
+            }
+            // A request's headers arrived: turn it into a session. Kept on this
+            // task because it is what owns `sessions`.
+            Some(resolved) = pending_requests.next(), if !pending_requests.is_empty() => {
+                match resolved {
+                    Ok((req, stream)) => {
+                        handle_request(
+                            req, stream, &mut sessions, &state,
+                            &dgram_conn, &cleanup_tx,
+                        ).await;
+                    }
+                    Err(e) => log::error!("[server] Request resolve error: {e}"),
                 }
             }
             // Client -> tunnel: decode DATAGRAM and forward by session kind
