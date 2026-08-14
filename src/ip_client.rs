@@ -493,13 +493,11 @@ fn make_endpoint(
 /// one this connection already uses. It often cannot: a tunnel that came up over
 /// cellular IPv6 and then moves to a v4-only Wi-Fi has no route to it at all.
 /// `connect` on a UDP socket resolves the route without sending anything, so a
-/// throwaway socket answers that question before the live socket is replaced;
-/// `rebind` on its own would succeed and then blackhole every send until the
-/// idle timeout.
+/// throwaway socket answers that question up front — an error here means "give up
+/// and reconnect", which re-resolves DNS and races both families, instead of
+/// discovering the same thing when the connection eventually times out.
 ///
-/// An error here means "leave the connection where it is", not "reconnect" — see
-/// the caller. quinn also keeps the old socket when the rebind itself fails, so
-/// either failure leaves the endpoint untouched.
+/// quinn keeps the old socket if the rebind itself fails, so a failure is a no-op.
 fn rebind_endpoint(ep: &quinn::Endpoint, remote: SocketAddr) -> std::io::Result<()> {
     let bind = if remote.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
     {
@@ -944,17 +942,11 @@ async fn run_tunnel(
                             .send_datagram(encode_datagram_ctx(quic_stream_id, 1, &[]));
                     }
                     // The new path cannot carry this connection — most often it
-                    // has no route to the proxy's address family. Staying put is
-                    // the better answer: the interface this connection is already
-                    // on does not go away when another one appears (joining Wi-Fi
-                    // does not drop cellular), so it very often keeps working,
-                    // and tearing the tunnel down would spend a full handshake to
-                    // find that out. If the old path really is dead, the 10s
-                    // keepalive goes unanswered and the 30s idle timeout hands it
-                    // to the normal drop detection.
-                    Err(e) => log::warn!(
-                        "[client] keeping the current socket, the new path cannot reach the proxy: {e}"
-                    ),
+                    // has no route to the proxy's address family. Reconnecting is
+                    // the only way forward and it can pick a different address, so
+                    // fail out now rather than waiting for the idle timeout to
+                    // notice that every send is going nowhere.
+                    Err(e) => return Err(format!("rebind failed: {e}").into()),
                 }
             }
             Event::Shutdown => {
