@@ -104,6 +104,23 @@ void masque_client_ip_update_tun_fd(const MasqueHandle *handle, int32_t tun_fd);
 // handle must be live (not yet stopped).
 void masque_client_ip_reconnect(const MasqueHandle *handle);
 
+// Moves the live tunnel onto a fresh UDP socket without tearing it down (QUIC
+// connection migration, RFC 9000 section 9): the connection, its CONNECT-IP
+// session, and the assigned addresses all survive; only the client's local
+// address changes and the proxy revalidates the path.
+//
+// Prefer this over masque_client_ip_reconnect on a network path change: it
+// costs one round trip of path validation, where a reconnect costs a QUIC
+// handshake, a CONNECT, and an ADDRESS_REQUEST — about five round trips with no
+// traffic flowing, and a fresh handshake visible on the wire.
+//
+// Because the tunnel never goes down, the host must NOT set the provider's
+// reasserting for this. If the new path cannot reach the proxy (no route, or a
+// family it does not have), the old socket is kept and the normal drop
+// detection reconnects — so a failed rebind costs nothing. No-op if not
+// running. handle must be live (not yet stopped).
+void masque_client_ip_rebind(const MasqueHandle *handle);
+
 // Stops the client, joins its worker thread, and frees the handle.
 // Call at most once per handle.
 void masque_client_ip_stop(MasqueHandle *handle);

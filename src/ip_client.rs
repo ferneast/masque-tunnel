@@ -173,6 +173,14 @@ async fn wait_reconnect(notify: Option<&std::sync::Arc<tokio::sync::Notify>>) {
     }
 }
 
+/// Await the host's rebind signal, or pend forever when none is wired.
+async fn wait_rebind(notify: Option<&std::sync::Arc<tokio::sync::Notify>>) {
+    match notify {
+        Some(n) => n.notified().await,
+        None => std::future::pending().await,
+    }
+}
+
 /// Await the host's graceful-shutdown signal, or pend forever when none is
 /// wired (desktop CLI, which stops on SIGINT/SIGTERM instead). Only one waiter
 /// observes this at a time (the active `run_tunnel`, else the reconnect
@@ -195,6 +203,28 @@ enum TunnelExit {
 /// or — with `auto_reconnect` off — surfaces each drop to the host via
 /// `ClientEvents::reconnect_needed` and waits for its `reconnect` signal.
 pub async fn run(config: IpClientConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    run_with_rebind(config, None).await
+}
+
+/// `run`, plus a signal that moves the live connection onto a fresh UDP socket
+/// without tearing it down (QUIC connection migration, RFC 9000 §9): the
+/// connection, its CONNECT-IP session, and the assigned addresses all survive,
+/// and only the client's local address changes.
+///
+/// This is what a host with a network-path callback should fire on a path
+/// change — it costs one round trip of path validation, where a reconnect costs
+/// a handshake, a CONNECT, and an ADDRESS_REQUEST. It is a separate entry point
+/// rather than an `IpClientConfig` field because only such a host can drive it;
+/// the CLI has nothing to fire it from.
+///
+/// Migration cannot change the proxy address, so a path that cannot reach the
+/// one already in use — no route, or a family the new network does not have —
+/// makes the client give up and reconnect, which re-resolves DNS and races both
+/// families.
+pub async fn run_with_rebind(
+    config: IpClientConfig,
+    rebind: Option<std::sync::Arc<tokio::sync::Notify>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let url = url::Url::parse(&config.proxy_url)?;
     let proxy_host = url.host_str().ok_or("missing host in proxy URL")?.to_string();
     let proxy_port = url.port().unwrap_or(443);
@@ -247,8 +277,8 @@ pub async fn run(config: IpClientConfig) -> Result<(), Box<dyn std::error::Error
             // connection gracefully), so it is not raced here.
             let step = tokio::select! {
                 res = run_tunnel(
-                    &config, &client_config, &proxy_host, proxy_port, &sni, &mut tun, &mut routes,
-                    &mut dns, &mut established, &mut cached,
+                    &config, rebind.as_ref(), &client_config, &proxy_host, proxy_port, &sni,
+                    &mut tun, &mut routes, &mut dns, &mut established, &mut cached,
                 ) => {
                     match res {
                         Ok(TunnelExit::Shutdown) => Step::Shutdown,
@@ -454,6 +484,30 @@ fn make_endpoint(
     Ok(ep)
 }
 
+/// Swap the endpoint onto a freshly bound socket of the same family, keeping
+/// every connection on it alive (RFC 9000 §9 migration). The port is left to
+/// the system: a QUIC connection is identified by its connection ID, not by the
+/// four-tuple, and any NAT mapping the old port had is gone with the old path.
+///
+/// Migration cannot change the proxy address, so the new path has to reach the
+/// one this connection already uses. It often cannot: a tunnel that came up over
+/// cellular IPv6 and then moves to a v4-only Wi-Fi has no route to it at all.
+/// `connect` on a UDP socket resolves the route without sending anything, so a
+/// throwaway socket answers that question up front — an error here means "give up
+/// and reconnect", which re-resolves DNS and races both families, instead of
+/// discovering the same thing when the connection eventually times out.
+///
+/// quinn keeps the old socket if the rebind itself fails, so a failure is a no-op.
+fn rebind_endpoint(ep: &quinn::Endpoint, remote: SocketAddr) -> std::io::Result<()> {
+    let bind = if remote.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+    {
+        let probe = std::net::UdpSocket::bind(bind)?;
+        probe.connect(remote)?;
+    }
+    let socket = std::net::UdpSocket::bind(bind)?;
+    ep.rebind(socket)
+}
+
 /// Bound one candidate's handshake. quinn has no handshake timeout of its own,
 /// so a candidate whose address has no route on the current path — a stale IPv6
 /// address after a switch to a v4-only Wi-Fi, where every send fails locally
@@ -599,11 +653,14 @@ enum Event {
     AssignTimeout,
     /// The host asked to stop; close the connection gracefully and exit.
     Shutdown,
+    /// The host asked to move onto a fresh socket, keeping the connection.
+    Rebind,
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn run_tunnel(
     config: &IpClientConfig,
+    rebind: Option<&std::sync::Arc<tokio::sync::Notify>>,
     client_config: &quinn::ClientConfig,
     proxy_host: &str,
     proxy_port: u16,
@@ -765,6 +822,7 @@ async fn run_tunnel(
             _ = wait_tun_fd_change(config.tun_fd.as_ref()) => Event::TunFdChanged,
             _ = tokio::time::sleep_until(assign_deadline), if !ever_assigned => Event::AssignTimeout,
             _ = wait_shutdown(config.shutdown.as_ref()) => Event::Shutdown,
+            _ = wait_rebind(rebind) => Event::Rebind,
         };
 
         match event {
@@ -855,6 +913,41 @@ async fn run_tunnel(
             }
             Event::AssignTimeout => {
                 return Err("proxy did not assign an address within 10s".into())
+            }
+            Event::Rebind => {
+                // Move onto a fresh socket on the endpoint that carries this
+                // connection. The proxy address is part of the connection and
+                // cannot change, so the family is fixed: only a socket of the
+                // same family can reach it.
+                let ep = if winning.is_ipv4() { ep_v4.as_ref() } else { ep_v6.as_ref() };
+                let Some(ep) = ep else {
+                    log::warn!("[client] rebind requested but no endpoint for the proxy's family");
+                    continue;
+                };
+                let before = ep.local_addr().ok();
+                match rebind_endpoint(ep, winning) {
+                    Ok(()) => {
+                        let after = ep.local_addr().ok();
+                        log::info!(
+                            "[client] rebound socket {} -> {}",
+                            before.map(|a| a.to_string()).unwrap_or_else(|| "?".into()),
+                            after.map(|a| a.to_string()).unwrap_or_else(|| "?".into()),
+                        );
+                        // Nudge the connection so path validation starts now
+                        // rather than at the next keepalive: any ack-eliciting
+                        // packet from the new address will do. A non-zero
+                        // context ID is the empty keepalive the proxy drops
+                        // instead of forwarding (see encode_datagram_ctx).
+                        let _ = dgram_conn
+                            .send_datagram(encode_datagram_ctx(quic_stream_id, 1, &[]));
+                    }
+                    // The new path cannot carry this connection — most often it
+                    // has no route to the proxy's address family. Reconnecting is
+                    // the only way forward and it can pick a different address, so
+                    // fail out now rather than waiting for the idle timeout to
+                    // notice that every send is going nowhere.
+                    Err(e) => return Err(format!("rebind failed: {e}").into()),
+                }
             }
             Event::Shutdown => {
                 // Close the QUIC connection so the proxy sees an explicit
