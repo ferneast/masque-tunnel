@@ -163,12 +163,13 @@ fn routes_json(ranges: &[IpAddressRange]) -> String {
 }
 
 /// Opaque handle owning the worker thread, its graceful-shutdown signal, the
-/// traffic counters, and the immediate-reconnect signal.
+/// traffic counters, and the immediate-reconnect and rebind signals.
 pub struct MasqueHandle {
     shutdown: Arc<tokio::sync::Notify>,
     thread: Option<std::thread::JoinHandle<()>>,
     stats: Arc<TunnelStats>,
     reconnect: Arc<tokio::sync::Notify>,
+    rebind: Arc<tokio::sync::Notify>,
     tun_fd: Arc<TunFdSlot>,
 }
 
@@ -239,6 +240,8 @@ pub unsafe extern "C" fn masque_client_ip_start(
         .unwrap_or_default();
     let stats = Arc::new(TunnelStats::default());
     let reconnect = Arc::new(tokio::sync::Notify::new());
+    let rebind = Arc::new(tokio::sync::Notify::new());
+    let rebind_signal = rebind.clone();
     let shutdown = Arc::new(tokio::sync::Notify::new());
     let tun_fd_slot = Arc::new(TunFdSlot::new(tun_fd));
 
@@ -278,7 +281,7 @@ pub unsafe extern "C" fn masque_client_ip_start(
             // `run` loops forever reconnecting; it returns cleanly once the host
             // signals shutdown (having closed the connection gracefully), or on a
             // fatal setup error, which we surface to the host.
-            if let Err(e) = ip_client::run(config).await {
+            if let Err(e) = ip_client::run_with_rebind(config, Some(rebind_signal)).await {
                 report_error(&callbacks, &e.to_string());
             }
         });
@@ -289,6 +292,7 @@ pub unsafe extern "C" fn masque_client_ip_start(
         thread: Some(thread),
         stats,
         reconnect,
+        rebind,
         tun_fd: tun_fd_slot,
     }))
 }
@@ -328,6 +332,31 @@ pub unsafe extern "C" fn masque_client_ip_reconnect(handle: *const MasqueHandle)
         return;
     }
     (*handle).reconnect.notify_one();
+}
+
+/// Move the live tunnel onto a fresh UDP socket without tearing it down (QUIC
+/// connection migration, RFC 9000 §9): the connection, its CONNECT-IP session,
+/// and the assigned addresses all survive, and only the client's local address
+/// changes. This is what a host should call on a network path change — it costs
+/// one round trip of path validation where `masque_client_ip_reconnect` costs a
+/// handshake, a CONNECT, and an ADDRESS_REQUEST.
+///
+/// The tunnel is never torn down as a result: a rebind that cannot bind, or a
+/// new path that cannot reach the proxy, leaves the old socket in place and the
+/// existing drop detection reconnects as before. Because the connection stays
+/// up, the host must NOT put the tunnel into reasserting for this.
+///
+/// No-op if the client is not running.
+///
+/// # Safety
+/// `handle` must be a live pointer returned by `masque_client_ip_start` (not
+/// yet stopped).
+#[no_mangle]
+pub unsafe extern "C" fn masque_client_ip_rebind(handle: *const MasqueHandle) {
+    if handle.is_null() {
+        return;
+    }
+    (*handle).rebind.notify_one();
 }
 
 /// Read the cumulative tunneled byte counters (survive reconnects). Either
