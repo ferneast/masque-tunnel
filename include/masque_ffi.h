@@ -116,8 +116,11 @@ void masque_client_ip_reconnect(const MasqueHandle *handle);
 //
 // Because the tunnel never goes down, the host must NOT set the provider's
 // reasserting for this. If the new path cannot reach the proxy (no route, or a
-// family it does not have), the old socket is kept and the normal drop
-// detection reconnects — so a failed rebind costs nothing. No-op if not
+// family it does not have), the connection is left exactly as it was, still on
+// the old socket — which usually keeps working, since the interface it is on
+// does not go away when a new one appears. Only if that path is genuinely dead
+// does the idle timeout hand it to the normal drop detection. So a failed
+// rebind costs nothing and never forces a reconnect on its own. No-op if not
 // running. handle must be live (not yet stopped).
 void masque_client_ip_rebind(const MasqueHandle *handle);
 
