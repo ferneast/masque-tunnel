@@ -17,7 +17,7 @@ MASQUE solves exactly this: CONNECT-UDP ([RFC 9298](https://datatracker.ietf.org
 - **Client + Server** — single binary with `client` / `client-ip` / `server` subcommands
 - **Obfuscation** — traffic appears as standard HTTPS/QUIC on port 443
 - **Decoy site** — anything that is not an authenticated tunnel session is answered as an ordinary web server would, so an active probe sees a website rather than a proxy ([details](#decoy-site---masquerade-dir----masquerade-url))
-- **Handshake that outgrows the first datagram** — the PQ key share pushes the ClientHello past one QUIC Initial, so the SNI is not in the datagram the GFW's QUIC filter inspects ([details](#sni-placement-in-the-handshake))
+- **Handshake that outgrows the first datagram** — the PQ key share pushes the ClientHello past one QUIC Initial, so the SNI is not in the first datagram that on-path SNI filters typically inspect ([details](#sni-placement-in-the-handshake))
 - **Authentication** — optional Bearer token for client verification, compared in constant time
 - **Full-tunnel client extras** — `--redirect-gateway` to take over the default route, `--dns` to set system resolvers (both reverted on exit)
 - **Happy Eyeballs ([RFC 8305](https://datatracker.ietf.org/doc/html/rfc8305))** — dual-stack clients race IPv4/IPv6 handshakes so a dead family never wedges connect
@@ -151,11 +151,11 @@ The tradeoff for operators: a wrong `--auth-token` no longer produces a distinct
 
 ### SNI placement in the handshake
 
-A QUIC Initial packet is encrypted with keys derived from the destination connection ID and a fixed, published salt, so any observer on the path can decrypt it and read the SNI. The GFW has done exactly this at national scale since August 2024 ([USENIX Security 2025](https://gfw.report/publications/usenixsecurity25/en/)); a match drops every packet of the `(src IP, dst IP, dst port)` triple for 180 seconds, which presents as "the tunnel died and came back a few minutes later".
+A QUIC Initial packet is encrypted with keys derived from the destination connection ID and a fixed, published salt, so any observer on the path can decrypt it and read the SNI. On-path middleboxes are known to filter QUIC connections this way; a match typically drops every packet of the `(src IP, dst IP, dst port)` triple for some minutes, which presents as "the tunnel died and came back a few minutes later".
 
-That filter inspects only the **first datagram** of a flow and does not reassemble a ClientHello spread across several. This build enables rustls's `prefer-post-quantum`, which offers `X25519MLKEM768` first; its ~1216-byte key share pushes the ClientHello over the ~1200-byte Initial budget, so the handshake occupies two datagrams and the SNI is not in the one being read. `tests/initial_flight.rs` asserts the spill, and fails if a dependency change quietly shrinks the ClientHello again.
+Such filters commonly inspect only the **first datagram** of a flow and do not reassemble a ClientHello spread across several. This build enables rustls's `prefer-post-quantum`, which offers `X25519MLKEM768` first; its ~1216-byte key share pushes the ClientHello over the ~1200-byte Initial budget, so the handshake occupies two datagrams and the SNI is not in the one being read. `tests/initial_flight.rs` asserts the spill, and fails if a dependency change quietly shrinks the ClientHello again.
 
-Two caveats worth being clear about. This exploits an implementation shortcut, not a protocol property — it holds until the filter learns to reassemble. And the GFW's QUIC list is a *blocklist*: a domain that was never listed was never being filtered on SNI, so this is insurance against your domain being added, not necessarily a fix for a connection failing today. It also costs ~1.2 KB per handshake, and does nothing about an IP-level block.
+Two caveats worth being clear about. This exploits an implementation shortcut, not a protocol property — it holds until the filter learns to reassemble. And SNI filtering of this kind is usually *blocklist*-based: a domain that was never listed was never being filtered on SNI, so this is insurance against your domain being added, not necessarily a fix for a connection failing today. It also costs ~1.2 KB per handshake, and does nothing about an IP-level block.
 
 ### DNS assignment (`--dns-assign`)
 
