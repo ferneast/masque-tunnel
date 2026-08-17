@@ -814,18 +814,23 @@ async fn run_tunnel(
             ]))
             .await?;
         log::debug!("[client] sent ADDRESS_REQUEST (v4={req_v4}, v6={req_v6})");
-        Ok::<_, Box<dyn std::error::Error + Send + Sync>>((stream, quic_stream_id))
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>((stream, quic_stream_id, send_request))
     };
-    let (mut stream, quic_stream_id) = match tokio::time::timeout(SETUP_TIMEOUT, setup).await {
-        Ok(r) => r?,
-        Err(_) => {
-            return Err(format!(
-                "CONNECT-IP setup stalled for {}s after the QUIC handshake",
-                SETUP_TIMEOUT.as_secs()
-            )
-            .into())
-        }
-    };
+    // `send_request` must outlive the session, not the setup: dropping the last
+    // SendRequest closes the connection with H3_NO_ERROR "Connection closed by
+    // client", so letting it die with the block above would tear the tunnel down
+    // the instant it came up.
+    let (mut stream, quic_stream_id, _send_request) =
+        match tokio::time::timeout(SETUP_TIMEOUT, setup).await {
+            Ok(r) => r?,
+            Err(_) => {
+                return Err(format!(
+                    "CONNECT-IP setup stalled for {}s after the QUIC handshake",
+                    SETUP_TIMEOUT.as_secs()
+                )
+                .into())
+            }
+        };
 
     let mut parser = CapsuleParser::default();
     let mut pkt_buf = vec![0u8; config.mtu.max(1280) as usize + 64];
