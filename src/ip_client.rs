@@ -385,7 +385,12 @@ fn build_client_config(
     transport.initial_mtu(1350);
     transport.datagram_receive_buffer_size(Some(8_000_000));
     transport.datagram_send_buffer_size(8_000_000);
-    transport.max_idle_timeout(Some(Duration::from_secs(30).try_into()?));
+    // Must match the server's advertised value: the effective idle timeout is the
+    // minimum of the two, so a shorter one here would keep reaping tunnels the
+    // server is willing to hold. See the note in server.rs — the host process is
+    // throttled while the device is idle, so the keep-alive below does not
+    // actually fire on its nominal interval and the timeout has to cover the gap.
+    transport.max_idle_timeout(Some(Duration::from_secs(120).try_into()?));
     // quinn PING frames keep an idle tunnel under max_idle_timeout, replacing the
     // app-level keepalive datagram the forwarding loop used to send.
     transport.keep_alive_interval(Some(Duration::from_secs(10)));
@@ -516,6 +521,17 @@ fn rebind_endpoint(ep: &quinn::Endpoint, remote: SocketAddr) -> std::io::Result<
 /// resolver is down and the cached address is the only candidate, it is the
 /// whole reconnect.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Bound everything between a completed QUIC handshake and a usable CONNECT-IP
+/// session: the h3 setup, the CONNECT request/response, and the ADDRESS_REQUEST.
+/// None of those awaits carries a timeout of its own, so a peer that completes
+/// the handshake and then goes quiet strands the reconnect until the QUIC idle
+/// timeout — and only if it goes quiet at the QUIC layer too, which it need not.
+/// A host whose process is throttled mid-setup produces exactly that: the
+/// handshake lands, the CONNECT never leaves, and on iOS the tunnel sits in
+/// `reasserting` with its default routes still installed, black-holing every app
+/// on the device. Failing fast reconnects instead.
+const SETUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// One Happy Eyeballs attempt: hand back the connection only once its handshake
 /// completes, which takes hearing from the server and so proves the path works.
@@ -705,101 +721,122 @@ async fn run_tunnel(
     // CONNECT-IP request/response stream (and its capsule body).
     let dgram_conn = conn.clone();
     let h3_conn = h3_quinn::Connection::new(conn.clone());
-    let (mut driver, mut send_request) = h3::client::builder()
-        .enable_extended_connect(true)
-        .enable_datagram(true)
-        .build::<h3_quinn::Connection, h3_quinn::OpenStreams, Bytes>(h3_conn)
-        .await?;
-    tokio::spawn(async move {
-        let _ = driver.wait_idle().await;
-    });
 
-    // Full-tunnel CONNECT-IP request: target and ipproto are both the wildcard,
-    // which RFC 9484 Errata ID 8444 requires be percent-encoded as `%2A` (not a
-    // literal `*`) in the URI template expansion.
-    let path = format!("{CONNECT_IP_PATH}/%2A/%2A/");
-    let uri: http::Uri = format!("https://{proxy_host}{path}").parse()?;
-    let protocol: h3::ext::Protocol = "connect-ip".parse().map_err(|_| "invalid protocol")?;
-    let mut req_builder = http::Request::builder()
-        .method("CONNECT")
-        .uri(uri)
-        .header("capsule-protocol", "?1");
-    if let Some(token) = &config.auth_token {
-        req_builder = req_builder.header("proxy-authorization", format!("Bearer {token}"));
-    }
-    req_builder = apply_extra_headers(req_builder, &config.extra_headers);
-    let req = req_builder.extension(protocol).body(())?;
+    // Everything up to the ADDRESS_REQUEST runs under SETUP_TIMEOUT; see the
+    // constant for why an unbounded setup is what turns a stalled reconnect into
+    // a device-wide outage.
+    let setup = async {
+        let (mut driver, mut send_request) = h3::client::builder()
+            .enable_extended_connect(true)
+            .enable_datagram(true)
+            .build::<h3_quinn::Connection, h3_quinn::OpenStreams, Bytes>(h3_conn)
+            .await?;
+        tokio::spawn(async move {
+            let _ = driver.wait_idle().await;
+        });
 
-    let mut stream = send_request.send_request(req).await?;
-    let resp = stream.recv_response().await?;
-    if resp.status() != http::StatusCode::OK {
-        // The proxy answers every unauthenticated request from its decoy site,
-        // so a rejected session looks like an ordinary web response and cannot
-        // name the reason — that indistinguishability is the point. Spell out
-        // the candidates, or a 404 here reads as a wrong path and nothing else.
-        return Err(format!(
-            "CONNECT-IP rejected: status {} (check --auth-token and --proxy-url, \
-             and that the server runs with --ip-pool; the proxy serves its decoy \
-             site to any request it does not accept)",
-            resp.status()
-        )
-        .into());
-    }
-    if let Some(server) = resp.headers().get("server").and_then(|v| v.to_str().ok()) {
-        log::info!("[client] proxy server: {server}");
-    }
+        // Full-tunnel CONNECT-IP request: target and ipproto are both the wildcard,
+        // which RFC 9484 Errata ID 8444 requires be percent-encoded as `%2A` (not a
+        // literal `*`) in the URI template expansion.
+        let path = format!("{CONNECT_IP_PATH}/%2A/%2A/");
+        let uri: http::Uri = format!("https://{proxy_host}{path}").parse()?;
+        let protocol: h3::ext::Protocol = "connect-ip".parse().map_err(|_| "invalid protocol")?;
+        let mut req_builder = http::Request::builder()
+            .method("CONNECT")
+            .uri(uri)
+            .header("capsule-protocol", "?1");
+        if let Some(token) = &config.auth_token {
+            req_builder = req_builder.header("proxy-authorization", format!("Bearer {token}"));
+        }
+        req_builder = apply_extra_headers(req_builder, &config.extra_headers);
+        let req = req_builder.extension(protocol).body(())?;
 
-    // The raw QUIC stream ID feeds the DATAGRAM quarter-stream-id (id/4).
-    let quic_stream_id = stream.id().index() * 4;
-    log::info!("[client] CONNECT-IP established (stream_id={quic_stream_id})");
-    // The server accepted CONNECT-IP: this attempt genuinely connected, so the
-    // reconnect loop resets its backoff floor.
-    *established = true;
+        let mut stream = send_request.send_request(req).await?;
+        let resp = stream.recv_response().await?;
+        if resp.status() != http::StatusCode::OK {
+            // The proxy answers every unauthenticated request from its decoy site,
+            // so a rejected session looks like an ordinary web response and cannot
+            // name the reason — that indistinguishability is the point. Spell out
+            // the candidates, or a 404 here reads as a wrong path and nothing else.
+            return Err(format!(
+                "CONNECT-IP rejected: status {} (check --auth-token and --proxy-url, \
+                 and that the server runs with --ip-pool; the proxy serves its decoy \
+                 site to any request it does not accept)",
+                resp.status()
+            )
+            .into());
+        }
+        if let Some(server) = resp.headers().get("server").and_then(|v| v.to_str().ok()) {
+            log::info!("[client] proxy server: {server}");
+        }
 
-    // Interactive assignment (RFC 9484 §4.7.2): request one address per family.
-    // The address currently held on the TUN binding is requested so the proxy
-    // keeps this client's tunnel IP stable across reconnects — avoiding a TUN
-    // renumber and keeping both views in sync even if an ADDRESS_ASSIGN is lost.
-    // On the cold start, before any assignment, nothing is held: fall back to the
-    // operator-configured preferred address (if any, and of the right family) so
-    // a fresh tunnel can still request a stable IP; otherwise send the all-zero
-    // "no preference" sentinel, which an older proxy simply answers with its own
-    // choice at Request ID 0. A held address always wins over the configured hint.
-    let held_v4 = tun
-        .as_ref()
-        .and_then(|b| b.addrs.iter().find(|(a, _)| a.is_ipv4()).map(|(a, _)| *a));
-    let held_v6 = tun
-        .as_ref()
-        .and_then(|b| b.addrs.iter().find(|(a, _)| a.is_ipv6()).map(|(a, _)| *a));
-    // The configured list may carry both families; each request slot takes the
-    // first entry of its own family (extra same-family entries are ignored — the
-    // request has one slot per family).
-    let pref_v4 = config.preferred_addresses.iter().copied().find(|a| a.is_ipv4());
-    let pref_v6 = config.preferred_addresses.iter().copied().find(|a| a.is_ipv6());
-    let req_v4 = request_address(held_v4, pref_v4, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
-    let req_v6 = request_address(held_v6, pref_v6, IpAddr::V6(Ipv6Addr::UNSPECIFIED));
-    stream
-        .send_data(encode_address_request(&[
-            RequestedAddress {
-                request_id: 1,
-                addr: req_v4,
-                prefix_len: 32,
-            },
-            RequestedAddress {
-                request_id: 2,
-                addr: req_v6,
-                prefix_len: 128,
-            },
-        ]))
-        .await?;
-    log::debug!("[client] sent ADDRESS_REQUEST (v4={req_v4}, v6={req_v6})");
+        // The raw QUIC stream ID feeds the DATAGRAM quarter-stream-id (id/4).
+        let quic_stream_id = stream.id().index() * 4;
+        log::info!("[client] CONNECT-IP established (stream_id={quic_stream_id})");
+        // The server accepted CONNECT-IP: this attempt genuinely connected, so the
+        // reconnect loop resets its backoff floor.
+        *established = true;
+
+        // Interactive assignment (RFC 9484 §4.7.2): request one address per family.
+        // The address currently held on the TUN binding is requested so the proxy
+        // keeps this client's tunnel IP stable across reconnects — avoiding a TUN
+        // renumber and keeping both views in sync even if an ADDRESS_ASSIGN is lost.
+        // On the cold start, before any assignment, nothing is held: fall back to the
+        // operator-configured preferred address (if any, and of the right family) so
+        // a fresh tunnel can still request a stable IP; otherwise send the all-zero
+        // "no preference" sentinel, which an older proxy simply answers with its own
+        // choice at Request ID 0. A held address always wins over the configured hint.
+        let held_v4 = tun
+            .as_ref()
+            .and_then(|b| b.addrs.iter().find(|(a, _)| a.is_ipv4()).map(|(a, _)| *a));
+        let held_v6 = tun
+            .as_ref()
+            .and_then(|b| b.addrs.iter().find(|(a, _)| a.is_ipv6()).map(|(a, _)| *a));
+        // The configured list may carry both families; each request slot takes the
+        // first entry of its own family (extra same-family entries are ignored — the
+        // request has one slot per family).
+        let pref_v4 = config.preferred_addresses.iter().copied().find(|a| a.is_ipv4());
+        let pref_v6 = config.preferred_addresses.iter().copied().find(|a| a.is_ipv6());
+        let req_v4 = request_address(held_v4, pref_v4, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        let req_v6 = request_address(held_v6, pref_v6, IpAddr::V6(Ipv6Addr::UNSPECIFIED));
+        stream
+            .send_data(encode_address_request(&[
+                RequestedAddress {
+                    request_id: 1,
+                    addr: req_v4,
+                    prefix_len: 32,
+                },
+                RequestedAddress {
+                    request_id: 2,
+                    addr: req_v6,
+                    prefix_len: 128,
+                },
+            ]))
+            .await?;
+        log::debug!("[client] sent ADDRESS_REQUEST (v4={req_v4}, v6={req_v6})");
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>((stream, quic_stream_id))
+    };
+    let (mut stream, quic_stream_id) = match tokio::time::timeout(SETUP_TIMEOUT, setup).await {
+        Ok(r) => r?,
+        Err(_) => {
+            return Err(format!(
+                "CONNECT-IP setup stalled for {}s after the QUIC handshake",
+                SETUP_TIMEOUT.as_secs()
+            )
+            .into())
+        }
+    };
 
     let mut parser = CapsuleParser::default();
     let mut pkt_buf = vec![0u8; config.mtu.max(1280) as usize + 64];
-    // The proxy must assign an address promptly on a fresh tunnel; reconnect if
-    // none arrives. Once any address has been assigned, an empty ADDRESS_ASSIGN
-    // (withdraw-all, RFC 9484 §4.7.1) is legal and must not trip the deadline.
-    let mut ever_assigned = tun.is_some();
+    // The proxy must assign an address promptly; reconnect if none arrives. This
+    // tracks whether *this* connection has seen an ADDRESS_ASSIGN — seeding it
+    // from `tun.is_some()` disabled the deadline on every reconnect (the binding
+    // outlives the connection), which is exactly when a half-open session needs
+    // it. A withdraw-all (empty ADDRESS_ASSIGN, RFC 9484 §4.7.1) still counts as
+    // an assignment and must not trip the deadline, so this keys off the capsule
+    // arriving rather than off any address surviving it.
+    let mut ever_assigned = false;
     let assign_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
 
     loop {
@@ -831,13 +868,13 @@ async fn run_tunnel(
                 loop {
                     match parser.next_capsule() {
                         Ok(Some(capsule)) => {
-                            handle_capsule(capsule, tun, config, routes, proxy_ip, dns)?
+                            ever_assigned |=
+                                handle_capsule(capsule, tun, config, routes, proxy_ip, dns)?
                         }
                         Ok(None) => break,
                         Err(e) => return Err(format!("malformed capsule: {e}").into()),
                     }
                 }
-                ever_assigned |= tun.is_some();
             }
             Event::Capsule(None) => return Err("session closed by proxy".into()),
             Event::CapsuleErr(e) => return Err(format!("capsule stream error: {e}").into()),
@@ -972,6 +1009,9 @@ async fn run_tunnel(
     }
 }
 
+/// Returns whether this capsule was an ADDRESS_ASSIGN, which is what the caller
+/// uses to satisfy its assignment deadline — including a withdraw-all, which
+/// assigns nothing but still proves the proxy is answering.
 #[allow(clippy::too_many_arguments)]
 fn handle_capsule(
     capsule: Capsule,
@@ -980,7 +1020,8 @@ fn handle_capsule(
     routes: &mut crate::route::RouteSet,
     proxy_ip: IpAddr,
     dns: &mut crate::dns::DnsGuard,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let is_address_assign = capsule.capsule_type == CAPSULE_ADDRESS_ASSIGN;
     match capsule.capsule_type {
         CAPSULE_ADDRESS_ASSIGN => {
             let Some(addrs) = parse_address_assign(&capsule.payload) else {
@@ -1011,7 +1052,7 @@ fn handle_capsule(
             // creates; without it there is nothing to route toward.
             let Some(binding) = tun.as_ref() else {
                 log::warn!("[client] ROUTE_ADVERTISEMENT before an address was assigned; ignoring");
-                return Ok(());
+                return Ok(false);
             };
             for r in &ranges {
                 let proto = if r.ip_proto == 0 {
@@ -1029,7 +1070,7 @@ fn handle_capsule(
             // NEDNSSettings) from the advertisement; desktop installs them here.
             if let Some(events) = &config.events {
                 events.routes_advertised(&ranges);
-                return Ok(());
+                return Ok(false);
             }
             let tun_name = crate::tun_platform::device_name(&binding.dev);
             for r in &ranges {
@@ -1057,11 +1098,11 @@ fn handle_capsule(
         CAPSULE_DNS_ASSIGN => {
             let Some(servers) = parse_dns_assign(&capsule.payload) else {
                 log::warn!("[client] malformed DNS_ASSIGN");
-                return Ok(());
+                return Ok(false);
             };
             log::info!("[client] DNS_ASSIGN received: {servers:?}");
             if servers.is_empty() {
-                return Ok(());
+                return Ok(false);
             }
             // iOS/tvOS: the host programs NEDNSSettings. On desktop, adopt the
             // pushed resolvers unless the operator set --dns explicitly.
@@ -1083,7 +1124,7 @@ fn handle_capsule(
         // Unknown capsule types must be ignored (RFC 9297 §3.2).
         other => log::trace!("[client] Ignoring unknown capsule type {other:#x}"),
     }
-    Ok(())
+    Ok(is_address_assign)
 }
 
 /// Apply a declarative ADDRESS_ASSIGN (RFC 9484 §4.7.1): reconcile the TUN's
@@ -1435,5 +1476,82 @@ mod tests {
         assert!(builder.headers_ref().unwrap().get("bad name").is_none());
         assert!(builder.headers_ref().unwrap().get("x-bad-value").is_none());
         assert_eq!(header_values(&builder, "x-good"), vec!["v"]);
+    }
+
+    fn bare_config() -> IpClientConfig {
+        IpClientConfig {
+            proxy_url: "https://proxy.example.com:443".into(),
+            sni: None,
+            auth_token: None,
+            extra_headers: Vec::new(),
+            insecure: false,
+            ca: None,
+            mtu: 1280,
+            tun_name: None,
+            redirect_gateway: false,
+            dns: Vec::new(),
+            tun_fd: None,
+            events: None,
+            stats: None,
+            reconnect: None,
+            shutdown: None,
+            preferred_addresses: Vec::new(),
+            auto_reconnect: false,
+        }
+    }
+
+    /// Drive one capsule through `handle_capsule` with no device bound, which
+    /// keeps every branch off the system (no TUN, no routes, no resolver).
+    fn assign_flag_for(capsule: Capsule) -> bool {
+        let config = bare_config();
+        let mut tun = None;
+        let mut routes = crate::route::RouteSet::new();
+        let mut dns = crate::dns::DnsGuard::new(Vec::new());
+        handle_capsule(
+            capsule,
+            &mut tun,
+            &config,
+            &mut routes,
+            "192.0.2.1".parse().unwrap(),
+            &mut dns,
+        )
+        .unwrap()
+    }
+
+    /// Round-trip encoded bytes back through the parser the client actually uses.
+    fn capsule(bytes: Bytes) -> Capsule {
+        let mut parser = CapsuleParser::default();
+        parser.push(&bytes);
+        parser.next_capsule().unwrap().expect("one whole capsule")
+    }
+
+    #[test]
+    fn withdraw_all_still_counts_as_an_assignment() {
+        // An empty ADDRESS_ASSIGN is a legal withdraw-all (RFC 9484 §4.7.1). It
+        // assigns nothing, but it proves the proxy answered, so it must satisfy
+        // the caller's assignment deadline — otherwise the deadline fires on a
+        // session that is working exactly as specified.
+        assert!(assign_flag_for(capsule(encode_address_assign(&[]))));
+    }
+
+    // The non-empty assignment path is not covered here: it creates the TUN,
+    // which needs privileges and touches the host's interfaces. The withdraw-all
+    // case above shares its match arm and is the one with the subtle contract.
+
+    #[test]
+    fn other_capsules_do_not_count_as_an_assignment() {
+        // The deadline exists to catch a session that never gets an address, so
+        // unrelated capsule traffic must not satisfy it.
+        assert!(!assign_flag_for(capsule(encode_address_request(&[
+            RequestedAddress {
+                request_id: 1,
+                addr: "10.99.0.2".parse().unwrap(),
+                prefix_len: 32,
+            }
+        ]))));
+        assert!(!assign_flag_for(Capsule {
+            capsule_type: 0xdead_beef,
+            payload: Bytes::new(),
+        }));
     }
 }

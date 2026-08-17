@@ -46,14 +46,18 @@ pub async fn run(config: ClientConfig) -> Result<(), Box<dyn std::error::Error +
     transport.initial_mtu(1350);
     transport.datagram_receive_buffer_size(Some(8_000_000));
     transport.datagram_send_buffer_size(8_000_000);
+    // Must match the server's advertised value: the effective idle timeout is the
+    // minimum of the two. See the note in server.rs — the host process is
+    // throttled while the device is idle, so the keep-alive below does not
+    // actually fire on its nominal interval and the timeout has to cover the gap.
     transport.max_idle_timeout(Some(
-        Duration::from_secs(30)
+        Duration::from_secs(120)
             .try_into()
             .map_err(|e| format!("{e}"))?,
     ));
     // Send PING frames well under max_idle_timeout so an idle tunnel (e.g. an
-    // inner WireGuard flow with no traffic) doesn't hit the 30s idle timeout and
-    // churn a reconnect every ~30s.
+    // inner WireGuard flow with no traffic) doesn't churn a reconnect whenever
+    // it goes quiet.
     transport.keep_alive_interval(Some(Duration::from_secs(10)));
     transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
 

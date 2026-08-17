@@ -79,8 +79,15 @@ pub async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error +
     transport.initial_mtu(1350);
     transport.datagram_receive_buffer_size(Some(8_000_000));
     transport.datagram_send_buffer_size(8_000_000);
+    // Generous enough to outlast a mobile client whose keep-alive timer is not
+    // running. An iOS Network Extension is throttled while the device is idle,
+    // so its 10s PINGs arrive several times less often than that; anything close
+    // to the PING interval reaps healthy tunnels, and the client does not even
+    // notice until a later packet draws a stateless reset. The effective timeout
+    // is the minimum of the two advertised values, so this only takes effect
+    // once the client advertises the same.
     transport.max_idle_timeout(Some(
-        std::time::Duration::from_secs(30)
+        std::time::Duration::from_secs(120)
             .try_into()
             .map_err(|e| format!("{e}"))?,
     ));
