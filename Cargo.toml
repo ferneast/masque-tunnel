@@ -15,7 +15,7 @@ name = "masque-tunnel"
 path = "src/main.rs"
 
 [dependencies]
-quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs", "log", "platform-verifier", "bloom"] }
+quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs", "log", "platform-verifier", "bloom"] }
 h3 = "0.0.8"
 h3-quinn = "0.0.10"
 http = "1"
