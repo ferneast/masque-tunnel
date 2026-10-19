@@ -159,11 +159,11 @@ Two caveats worth being clear about. This exploits an implementation shortcut, n
 
 ### DNS assignment (`--dns-assign`)
 
-RFC 9484 assigns addresses and routes but no resolver, so a CONNECT-IP client otherwise needs `--dns` to know what DNS to use. `--dns-assign <addr>` (repeatable, IPv4/IPv6) makes the server advertise resolvers in a **DNS_ASSIGN capsule** ([draft-ietf-masque-connect-ip-dns](https://datatracker.ietf.org/doc/draft-ietf-masque-connect-ip-dns/)); a client that wasn't given its own `--dns` adopts them automatically. This is a minimal profile (plain Do53 addresses — no encrypted-DNS/SVCB or search domains yet).
+RFC 9484 assigns addresses and routes but no resolver, so a CONNECT-IP client otherwise needs `--dns` to know what DNS to use. `--dns-assign <addr>` (repeatable, IPv4/IPv6) makes the server advertise resolvers in a **DNS_ASSIGN capsule** ([draft-ietf-masque-connect-ip-dns-07](https://datatracker.ietf.org/doc/draft-ietf-masque-connect-ip-dns/07/)); a client that wasn't given its own `--dns` adopts them automatically. This is a minimal profile (plain Do53 addresses — no encrypted-DNS/SVCB or search domains yet). The server advertises its resolvers as serving every name (the DNS root as internal domain). A capsule may carry several DNS configurations; the client adopts the resolvers of those serving every name and ignores, with a warning, those scoped to specific internal domains, since split DNS is not supported.
 
-An explicit `--dns` on the client is permanent and always wins. An adopted set is treated as proxy state instead: a later `DNS_ASSIGN` naming different resolvers replaces it in place, so a client reconnecting to a reconfigured proxy follows the change rather than holding a resolver that has moved.
+An explicit `--dns` on the client is permanent and always wins. An adopted set is treated as proxy state instead: a later `DNS_ASSIGN` naming different resolvers replaces it in place, so a client reconnecting to a reconfigured proxy follows the change rather than holding a resolver that has moved. An empty `DNS_ASSIGN` — the draft's withdrawal signal — drops the adopted set and restores the system's original resolver; so does one carrying only resolvers this minimal profile can't use (encrypted DNS without plain addresses), since each `DNS_ASSIGN` supersedes the last.
 
-The draft has no IANA-assigned capsule type yet, so both ends hardcode a **provisional codepoint `0x1ACE_79EC`** (`CAPSULE_DNS_ASSIGN` in `src/capsule.rs`). This is a private-use value picked to avoid colliding with RFC 9484's registered types (`0x00`–`0x03`); it **must** be changed to the assigned codepoint once the draft is published as an RFC, and it is not interoperable with any other implementation until then.
+The draft has no IANA-assigned capsule type yet, so both ends use the **provisional codepoint `0x1ACE_79EC`** that the draft itself specifies (`CAPSULE_DNS_ASSIGN` in `src/capsule.rs`). Other implementations of the draft use the same value; it **must** be changed once the draft is published as an RFC, when IANA assigns a smaller one.
 
 ### Split tunnel (`--ip-routes-file`)
 
@@ -369,7 +369,7 @@ apps ──▶ TUN ──▶ client ──QUIC/H3──▶ server ──▶ TUN 
              (IP packets)  (port 443)      (assigned pool)
 ```
 
-1. Client sends an extended CONNECT (`:protocol = connect-ip`) with path `/.well-known/masque/ip/*/*/`.
+1. Client sends an extended CONNECT (`:protocol = connect-ip`) with path `/.well-known/masque/ip/%2A/%2A/` (the `*` wildcards percent-encoded, per [RFC 9484 Errata 8444](https://www.rfc-editor.org/errata/eid8444)).
 2. Server replies `200`; the client then sends an `ADDRESS_REQUEST` on the request stream, one entry per family — asking for the address it already holds (on a reconnect), else `--preferred-address`, else the all-zero "no preference".
 3. Server answers with an `ADDRESS_ASSIGN` (a /32 and/or /128 from its pool, echoing the Request IDs), a `ROUTE_ADVERTISEMENT` (the default route, or the `--ip-routes-file` set), and a `DNS_ASSIGN` if `--dns-assign` is configured.
 4. Client brings up a TUN with the assigned address; IP packets travel as QUIC DATAGRAMs (context-id 0), while capsules travel on the request stream.
@@ -393,7 +393,8 @@ Packet Too Big / hop-limit handling of
 Relative to RFC 9484, the following is **not** implemented:
 
 - **Scoped requests.** Only the full-tunnel wildcard request
-  (`/.well-known/masque/ip/*/*/`, target and IP protocol both `*`) is served. A
+  (`/.well-known/masque/ip/%2A/%2A/`, target and IP protocol both `*`; a literal
+  `*` from a pre-errata client is accepted too) is served. A
   request naming a specific target IP or IP protocol is rejected with `400`
   ([§4.1](https://datatracker.ietf.org/doc/html/rfc9484#section-4.1) permits a
   proxy to refuse these). There is no per-flow or per-protocol packet filtering.
@@ -416,8 +417,8 @@ Relative to RFC 9484, the following is **not** implemented:
   QUIC datagram ([RFC 6040](https://datatracker.ietf.org/doc/html/rfc6040)).
 
 **DNS assignment** is a separate, non-RFC extension via
-[draft-ietf-masque-connect-ip-dns](https://datatracker.ietf.org/doc/draft-ietf-masque-connect-ip-dns/)
-using a provisional capsule codepoint — see
+[draft-ietf-masque-connect-ip-dns-07](https://datatracker.ietf.org/doc/draft-ietf-masque-connect-ip-dns/07/)
+using the draft's provisional capsule codepoint — see
 [DNS assignment](#dns-assignment---dns-assign) above.
 
 ## License

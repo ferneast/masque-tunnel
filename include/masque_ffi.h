@@ -36,7 +36,8 @@ typedef struct {
     void (*on_state)(void *ctx, int32_t state, const char *detail);
     // JSON array of DNS resolver addresses advertised by the proxy
     // (DNS_ASSIGN, draft-ietf-masque-connect-ip-dns): ["8.8.8.8", ...]
-    // Called only when the proxy advertises DNS.
+    // Called only when the proxy advertises DNS; [] means the proxy withdrew
+    // its resolvers, and the host drops the pushed ones.
     void (*on_dns)(void *ctx, const char *dns_json);
     // The tunnel dropped and auto_reconnect was false at start: the client is
     // holding until the host triggers the retry. Prepare the platform (set the

@@ -7,7 +7,8 @@
 //! `--dns`, resolvers pushed by the proxy (DNS_ASSIGN) are adopted instead,
 //! and a later push with a different set replaces them in place — the pushed
 //! set is declarative proxy state, surviving reconfiguration across
-//! reconnects, not a one-shot override. This is independent of
+//! reconnects, not a one-shot override. A push with no resolvers withdraws the
+//! adopted set and restores the original configuration. This is independent of
 //! `--redirect-gateway`: taking over DNS and taking over the default route are
 //! orthogonal. If the chosen resolvers are not actually
 //! routed through the tunnel, queries would go out in cleartext, so we log a
@@ -93,16 +94,13 @@ impl DnsGuard {
     /// DNS_ASSIGN is declarative state, not an override: a later push with a
     /// different set (a reconnect to a reconfigured proxy) replaces it in
     /// place, so the client never keeps resolving through a resolver the proxy
-    /// has moved away from. Returns whether the pushed set is in effect.
+    /// has moved away from. An empty set withdraws the adopted one. Returns
+    /// whether the pushed set is in effect.
     pub fn adopt_pushed(
         &mut self,
         servers: Vec<IpAddr>,
         routes: &crate::route::RouteSet,
     ) -> io::Result<bool> {
-        // An empty push is not a withdrawal (the draft defines none); ignore it.
-        if servers.is_empty() {
-            return Ok(false);
-        }
         match adopt_action(self.explicit, self.applied, &self.servers, &servers) {
             AdoptAction::Ignore => Ok(false),
             AdoptAction::Unchanged => Ok(true),
@@ -115,6 +113,11 @@ impl DnsGuard {
                 self.servers = servers;
                 self.warn_if_leaky(routes);
                 self.reapply()?;
+                Ok(true)
+            }
+            AdoptAction::Withdraw => {
+                self.revert();
+                self.servers.clear();
                 Ok(true)
             }
         }
@@ -170,7 +173,7 @@ impl Drop for DnsGuard {
     }
 }
 
-/// What a (non-empty) DNS_ASSIGN does to the guard, given its current state.
+/// What a DNS_ASSIGN does to the guard, given its current state.
 #[derive(Debug, PartialEq, Eq)]
 enum AdoptAction {
     /// Explicit `--dns` wins; the push is ignored.
@@ -181,6 +184,9 @@ enum AdoptAction {
     Adopt,
     /// A different pushed set is applied: rewrite the resolver in place.
     Replace,
+    /// The push names no resolvers: drop the adopted set and restore the
+    /// original configuration.
+    Withdraw,
 }
 
 fn adopt_action(
@@ -191,6 +197,12 @@ fn adopt_action(
 ) -> AdoptAction {
     if explicit {
         AdoptAction::Ignore
+    } else if pushed.is_empty() {
+        if applied || !current.is_empty() {
+            AdoptAction::Withdraw
+        } else {
+            AdoptAction::Unchanged
+        }
     } else if !applied {
         AdoptAction::Adopt
     } else if current == pushed {
@@ -359,6 +371,32 @@ mod tests {
         assert_eq!(
             adopt_action(false, false, &ips(&["10.0.0.1"]), &ips(&["10.0.0.1"])),
             AdoptAction::Adopt
+        );
+    }
+
+    #[test]
+    fn empty_push_withdraws_the_adopted_set() {
+        assert_eq!(
+            adopt_action(false, true, &ips(&["10.0.0.1"]), &[]),
+            AdoptAction::Withdraw
+        );
+        // An adopted set whose apply failed is still dropped.
+        assert_eq!(
+            adopt_action(false, false, &ips(&["10.0.0.1"]), &[]),
+            AdoptAction::Withdraw
+        );
+    }
+
+    #[test]
+    fn empty_push_with_nothing_adopted_is_a_noop() {
+        assert_eq!(adopt_action(false, false, &[], &[]), AdoptAction::Unchanged);
+    }
+
+    #[test]
+    fn explicit_dns_ignores_withdrawals() {
+        assert_eq!(
+            adopt_action(true, true, &ips(&["10.0.0.1"]), &[]),
+            AdoptAction::Ignore
         );
     }
 }

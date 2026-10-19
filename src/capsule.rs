@@ -16,8 +16,8 @@ pub const CAPSULE_ADDRESS_ASSIGN: u64 = 0x01;
 pub const CAPSULE_ADDRESS_REQUEST: u64 = 0x02;
 /// ROUTE_ADVERTISEMENT capsule type (RFC 9484 §4.7.3).
 pub const CAPSULE_ROUTE_ADVERTISEMENT: u64 = 0x03;
-/// DNS_ASSIGN capsule type (draft-ietf-masque-connect-ip-dns). Provisional
-/// codepoint pending IANA assignment; changes when the draft becomes an RFC.
+/// DNS_ASSIGN capsule type (draft-ietf-masque-connect-ip-dns). The draft's own
+/// provisional codepoint; IANA assigns a smaller one when it becomes an RFC.
 pub const CAPSULE_DNS_ASSIGN: u64 = 0x1ACE_79EC;
 
 /// Upper bound on a single capsule's declared length. A hostile peer could
@@ -253,13 +253,19 @@ pub fn parse_route_advertisement(mut payload: &[u8]) -> Option<Vec<IpAddressRang
 }
 
 // ---------------------------------------------------------------------------
-// DNS_ASSIGN (draft-ietf-masque-connect-ip-dns). Minimal profile: plain Do53
+// DNS_ASSIGN (draft-ietf-masque-connect-ip-dns-07). Minimal profile: plain Do53
 // resolvers at IP addresses — no encrypted-DNS authentication domain, no SVCB
-// service parameters, no internal/search domains.
+// service parameters, no search domains, and no split DNS: internal domains
+// only tell a configuration that serves every name from a domain-scoped one.
+//
+// A capsule carries zero or more DNS Configurations (§3.4); an empty one
+// withdraws any configuration sent before, and each DNS Configuration must
+// carry at least one Nameserver (§3.3).
 //
 // DNS Configuration {
 //   Nameserver Count (i), Nameserver (..) ...,
-//   Internal Domain Count (i)=0, Search Domain Count (i)=0,
+//   Internal Domain Count (i), Internal Domain (Domain) ...,
+//   Search Domain Count (i), Search Domain (Domain) ...,
 // }
 // Nameserver {
 //   Service Priority (16), IPv4 Address Count (i), IPv4 Address (32) ...,
@@ -269,10 +275,16 @@ pub fn parse_route_advertisement(mut payload: &[u8]) -> Option<Vec<IpAddressRang
 // Domain { Domain Length (i), Domain Name (..) }
 // ---------------------------------------------------------------------------
 
-/// Encode a minimal DNS_ASSIGN capsule: one Nameserver entry per resolver
-/// address (Service Priority 1, empty auth domain, no SvcParams => plain Do53),
-/// and no internal/search domains.
+/// Encode a minimal DNS_ASSIGN capsule: one DNS Configuration with one
+/// Nameserver entry per resolver address (Service Priority 1, empty auth
+/// domain, no SvcParams => plain Do53), the DNS root as its only internal
+/// domain (it serves every name, as in the draft's full-tunnel example), and no
+/// search domains. No servers encodes the empty withdrawal capsule, since a DNS
+/// Configuration with no Nameserver is invalid.
 pub fn encode_dns_assign(servers: &[IpAddr]) -> Bytes {
+    if servers.is_empty() {
+        return encode_capsule(CAPSULE_DNS_ASSIGN, &[]);
+    }
     let mut cfg = BytesMut::new();
     put_varint(&mut cfg, servers.len() as u64); // Nameserver Count
     for s in servers {
@@ -292,19 +304,78 @@ pub fn encode_dns_assign(servers: &[IpAddr]) -> Bytes {
         put_varint(&mut cfg, 0); // Authentication Domain Name length (none)
         put_varint(&mut cfg, 0); // Service Parameters Length (plain Do53)
     }
-    put_varint(&mut cfg, 0); // Internal Domain Count
+    put_varint(&mut cfg, 1); // Internal Domain Count
+    put_varint(&mut cfg, 0); // Internal Domain: "" (the DNS root)
     put_varint(&mut cfg, 0); // Search Domain Count
     encode_capsule(CAPSULE_DNS_ASSIGN, &cfg)
 }
 
-/// Parse a DNS_ASSIGN capsule payload, returning the resolver IP addresses
-/// across all Nameserver entries. Authentication domains, SvcParams, and
-/// internal/search domains are parsed past but ignored (minimal profile).
-pub fn parse_dns_assign(payload: &[u8]) -> Option<Vec<IpAddr>> {
-    let mut buf = payload;
-    let (ns_count, n) = decode_varint(buf)?;
-    buf = &buf[n..];
+/// One DNS Configuration from a DNS_ASSIGN capsule, reduced to the minimal
+/// profile: the plain-DNS resolver addresses of its Nameserver entries and
+/// the internal domains they serve.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsConfiguration {
+    pub servers: Vec<IpAddr>,
+    pub internal_domains: Vec<String>,
+}
+
+impl DnsConfiguration {
+    /// Whether the resolvers serve every name, so they can stand in for the
+    /// system resolver: an internal domain of "" (the DNS root, §3.5), or "."
+    /// as pre-07 drafts' presentation format wrote it, or no internal domains
+    /// at all, as pre-07 senders (this crate's older servers included) encoded
+    /// a full-tunnel configuration.
+    pub fn is_global(&self) -> bool {
+        self.internal_domains.is_empty()
+            || self
+                .internal_domains
+                .iter()
+                .any(|d| d.is_empty() || d == ".")
+    }
+}
+
+/// The resolvers of the configurations that serve every name, in order and
+/// without repeats. Domain-scoped configurations are left out: without split
+/// DNS, installing them system-wide would send every query to resolvers only
+/// known to serve some names.
+pub fn global_resolvers(configs: &[DnsConfiguration]) -> Vec<IpAddr> {
     let mut out = Vec::new();
+    for s in configs
+        .iter()
+        .filter(|c| c.is_global())
+        .flat_map(|c| &c.servers)
+    {
+        if !out.contains(s) {
+            out.push(*s);
+        }
+    }
+    out
+}
+
+/// Parse a DNS_ASSIGN capsule payload into its DNS Configurations.
+/// Authentication domains, SvcParams, and search domains are parsed past but
+/// ignored (minimal profile). An empty payload is the withdrawal capsule and
+/// yields no configurations.
+pub fn parse_dns_assign(payload: &[u8]) -> Option<Vec<DnsConfiguration>> {
+    let mut buf = payload;
+    let mut out = Vec::new();
+    while !buf.is_empty() {
+        let (cfg, rest) = parse_dns_configuration(buf)?;
+        out.push(cfg);
+        buf = rest;
+    }
+    Some(out)
+}
+
+/// Parse one DNS Configuration off the front of `buf`, returning it and the
+/// bytes after it.
+fn parse_dns_configuration(mut buf: &[u8]) -> Option<(DnsConfiguration, &[u8])> {
+    let (ns_count, n) = decode_varint(buf)?;
+    if ns_count == 0 {
+        return None; // Nameserver Count MUST NOT be zero (§3.3)
+    }
+    buf = &buf[n..];
+    let mut servers = Vec::new();
     for _ in 0..ns_count {
         // Service Priority (16 bits) — unused in the minimal profile.
         if buf.len() < 2 {
@@ -315,33 +386,52 @@ pub fn parse_dns_assign(payload: &[u8]) -> Option<Vec<IpAddr>> {
         buf = &buf[n..];
         for _ in 0..v4c {
             let o: [u8; 4] = buf.get(..4)?.try_into().ok()?;
-            out.push(IpAddr::V4(Ipv4Addr::from(o)));
+            servers.push(IpAddr::V4(Ipv4Addr::from(o)));
             buf = &buf[4..];
         }
         let (v6c, n) = decode_varint(buf)?;
         buf = &buf[n..];
         for _ in 0..v6c {
             let o: [u8; 16] = buf.get(..16)?.try_into().ok()?;
-            out.push(IpAddr::V6(Ipv6Addr::from(o)));
+            servers.push(IpAddr::V6(Ipv6Addr::from(o)));
             buf = &buf[16..];
         }
-        // Authentication Domain Name (Domain): length + bytes, skipped.
-        let (dlen, n) = decode_varint(buf)?;
-        buf = buf.get(n + dlen as usize..)?;
-        // Service Parameters: length + bytes, skipped.
-        let (splen, n) = decode_varint(buf)?;
-        buf = buf.get(n + splen as usize..)?;
+        // Authentication Domain Name (Domain), then Service Parameters:
+        // length-prefixed, both skipped.
+        (_, buf) = take_prefixed(buf)?;
+        (_, buf) = take_prefixed(buf)?;
     }
-    // Internal + Search domains: counts + Domain entries, all skipped.
-    for _ in 0..2 {
-        let (count, n) = decode_varint(buf)?;
-        buf = &buf[n..];
-        for _ in 0..count {
-            let (dlen, n) = decode_varint(buf)?;
-            buf = buf.get(n + dlen as usize..)?;
-        }
+    let (internal_domains, rest) = parse_domains(buf)?;
+    let (_search_domains, rest) = parse_domains(rest)?;
+    Some((
+        DnsConfiguration {
+            servers,
+            internal_domains,
+        },
+        rest,
+    ))
+}
+
+/// Parse a count-prefixed list of Domain structures off the front of `buf`.
+/// Names are ASCII (IDNA A-labels); anything else is replaced, not rejected.
+fn parse_domains(mut buf: &[u8]) -> Option<(Vec<String>, &[u8])> {
+    let (count, n) = decode_varint(buf)?;
+    buf = &buf[n..];
+    let mut out = Vec::new();
+    for _ in 0..count {
+        let (name, rest) = take_prefixed(buf)?;
+        out.push(String::from_utf8_lossy(name).into_owned());
+        buf = rest;
     }
-    Some(out)
+    Some((out, buf))
+}
+
+/// Split a varint-length-prefixed field off the front of `buf`.
+fn take_prefixed(buf: &[u8]) -> Option<(&[u8], &[u8])> {
+    let (len, n) = decode_varint(buf)?;
+    let rest = &buf[n..];
+    let len = usize::try_from(len).ok()?;
+    (rest.len() >= len).then(|| rest.split_at(len))
 }
 
 #[cfg(test)]
@@ -369,14 +459,110 @@ mod tests {
         let capsules = parse_all(&wire);
         assert_eq!(capsules.len(), 1);
         assert_eq!(capsules[0].capsule_type, CAPSULE_DNS_ASSIGN);
-        assert_eq!(parse_dns_assign(&capsules[0].payload).unwrap(), servers);
+        let configs = parse_dns_assign(&capsules[0].payload).unwrap();
+        assert_eq!(
+            configs,
+            vec![DnsConfiguration {
+                servers: servers.clone(),
+                internal_domains: vec![String::new()],
+            }]
+        );
+        assert_eq!(global_resolvers(&configs), servers);
     }
 
     #[test]
-    fn dns_assign_empty_is_parseable() {
+    fn dns_assign_empty_is_the_withdrawal_capsule() {
         let wire = encode_dns_assign(&[]);
         let capsules = parse_all(&wire);
-        assert_eq!(parse_dns_assign(&capsules[0].payload).unwrap(), Vec::<IpAddr>::new());
+        assert_eq!(capsules[0].capsule_type, CAPSULE_DNS_ASSIGN);
+        assert!(capsules[0].payload.is_empty());
+        assert_eq!(parse_dns_assign(&capsules[0].payload).unwrap(), vec![]);
+    }
+
+    #[test]
+    fn dns_assign_rejects_zero_nameservers() {
+        // Nameserver Count 0, Internal Domain Count 0, Search Domain Count 0:
+        // what this crate sent for an empty set before draft -07 forbade it.
+        assert_eq!(parse_dns_assign(&[0, 0, 0]), None);
+    }
+
+    /// One DNS Configuration with a single plain-DNS IPv4 nameserver.
+    fn dns_configuration(server: [u8; 4], internal: &[&str], search: &[&str]) -> Vec<u8> {
+        let mut b = BytesMut::new();
+        put_varint(&mut b, 1); // Nameserver Count
+        b.put_u16(1); // Service Priority
+        put_varint(&mut b, 1);
+        b.put_slice(&server);
+        put_varint(&mut b, 0); // IPv6 Address Count
+        put_varint(&mut b, 0); // Authentication Domain Name
+        put_varint(&mut b, 0); // Service Parameters Length
+        for list in [internal, search] {
+            put_varint(&mut b, list.len() as u64);
+            for d in list {
+                put_varint(&mut b, d.len() as u64);
+                b.put_slice(d.as_bytes());
+            }
+        }
+        b.to_vec()
+    }
+
+    #[test]
+    fn dns_assign_parses_every_configuration() {
+        // The draft's split-tunnel example after a full-tunnel configuration.
+        let mut payload = dns_configuration([8, 8, 8, 8], &[""], &[]);
+        payload.extend(dns_configuration(
+            [192, 0, 2, 33],
+            &["internal.corp.example"],
+            &["internal.corp.example", "corp.example"],
+        ));
+        let configs = parse_dns_assign(&payload).unwrap();
+        assert_eq!(configs.len(), 2);
+        assert_eq!(configs[1].internal_domains, ["internal.corp.example"]);
+        assert!(configs[0].is_global());
+        assert!(!configs[1].is_global());
+        // The domain-scoped resolver is not promoted to system-wide.
+        assert_eq!(
+            global_resolvers(&configs),
+            ["8.8.8.8".parse::<IpAddr>().unwrap()]
+        );
+    }
+
+    #[test]
+    fn dns_assign_only_scoped_configurations_yield_no_resolvers() {
+        let payload = dns_configuration([192, 0, 2, 33], &["internal.corp.example"], &[]);
+        let configs = parse_dns_assign(&payload).unwrap();
+        assert!(global_resolvers(&configs).is_empty());
+    }
+
+    #[test]
+    fn dns_assign_pre_07_root_encodings_are_global() {
+        // No internal domains: what this crate's servers sent before -07.
+        let none = parse_dns_assign(&dns_configuration([10, 0, 0, 1], &[], &[])).unwrap();
+        assert!(none[0].is_global());
+        // "." for the root, as pre-07 drafts' presentation format allowed.
+        let dot = parse_dns_assign(&dns_configuration([10, 0, 0, 1], &["."], &[])).unwrap();
+        assert!(dot[0].is_global());
+    }
+
+    #[test]
+    fn dns_assign_resolvers_are_deduplicated_across_configurations() {
+        let mut payload = dns_configuration([8, 8, 8, 8], &[""], &[]);
+        payload.extend(dns_configuration([8, 8, 8, 8], &[], &[]));
+        let configs = parse_dns_assign(&payload).unwrap();
+        assert_eq!(
+            global_resolvers(&configs),
+            ["8.8.8.8".parse::<IpAddr>().unwrap()]
+        );
+    }
+
+    #[test]
+    fn dns_assign_rejects_a_truncated_trailing_configuration() {
+        let mut payload = dns_configuration([8, 8, 8, 8], &[""], &[]);
+        let second = dns_configuration([1, 1, 1, 1], &[""], &[]);
+        payload.extend(&second[..second.len() - 1]);
+        assert_eq!(parse_dns_assign(&payload), None);
+        // A Domain Length running past the end is malformed too.
+        assert_eq!(parse_dns_assign(&[1, 0, 1, 0, 0, 0, 0, 1, 5, b'a']), None);
     }
 
     #[test]

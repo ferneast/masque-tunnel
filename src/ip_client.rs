@@ -144,7 +144,8 @@ pub trait ClientEvents: Send + Sync {
     fn addresses_assigned(&self, addrs: &[(IpAddr, u8)]);
     /// The advertised route set (RFC 9484 ROUTE_ADVERTISEMENT).
     fn routes_advertised(&self, ranges: &[crate::capsule::IpAddressRange]);
-    /// Server-assigned DNS resolvers (draft-ietf-masque-connect-ip-dns).
+    /// Server-assigned DNS resolvers (draft-ietf-masque-connect-ip-dns), the
+    /// complete current set; empty when the proxy withdraws its resolvers.
     /// Default: ignore — a host that does not program DNS from capsules (e.g.
     /// one relying on the platform default) can leave this unimplemented.
     fn dns_assigned(&self, _servers: &[IpAddr]) {}
@@ -1101,13 +1102,26 @@ fn handle_capsule(
             }
         }
         CAPSULE_DNS_ASSIGN => {
-            let Some(servers) = parse_dns_assign(&capsule.payload) else {
+            let Some(configs) = parse_dns_assign(&capsule.payload) else {
                 log::warn!("[client] malformed DNS_ASSIGN");
                 return Ok(false);
             };
-            log::info!("[client] DNS_ASSIGN received: {servers:?}");
+            for c in configs.iter().filter(|c| !c.is_global()) {
+                log::warn!(
+                    "[client] DNS_ASSIGN: ignoring resolvers {:?} scoped to {:?} \
+                     (split DNS is not supported)",
+                    c.servers,
+                    c.internal_domains
+                );
+            }
+            let servers = global_resolvers(&configs);
+            // Each DNS_ASSIGN supersedes the last, so one naming no resolver
+            // this profile can use — the empty withdrawal capsule, or only
+            // encrypted-DNS or domain-scoped ones — withdraws the adopted one.
             if servers.is_empty() {
-                return Ok(false);
+                log::info!("[client] DNS_ASSIGN received: no resolvers (withdrawal)");
+            } else {
+                log::info!("[client] DNS_ASSIGN received: {servers:?}");
             }
             // iOS/tvOS: the host programs NEDNSSettings. On desktop, adopt the
             // pushed resolvers unless the operator set --dns explicitly.

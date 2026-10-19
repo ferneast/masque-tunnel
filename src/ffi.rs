@@ -36,7 +36,9 @@ pub struct MasqueCallbacks {
     pub on_state: extern "C" fn(ctx: *mut c_void, state: i32, detail: *const c_char),
     /// JSON array of DNS resolver addresses: `["8.8.8.8","2001:4860:4860::8888"]`
     /// (DNS_ASSIGN, draft-ietf-masque-connect-ip-dns). The host programs
-    /// `NEDNSSettings` from these. Called only when the proxy advertises DNS.
+    /// `NEDNSSettings` from these. Called only when the proxy advertises DNS;
+    /// `[]` means the proxy withdrew its resolvers, and the host drops the
+    /// pushed ones.
     pub on_dns: extern "C" fn(ctx: *mut c_void, dns_json: *const c_char),
     /// The tunnel dropped and `auto_reconnect` was false at start: the client
     /// is holding until the host triggers the retry. The host prepares the
