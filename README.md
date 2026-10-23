@@ -112,7 +112,7 @@ Commands:
 | `--dns` | | System resolver(s) to install while up, restored on exit (repeatable) | none |
 | `--preferred-address` | | Tunnel address to request on a cold start, before any is assigned (repeatable, one per family) | no preference |
 
-Both clients resolve trust the same way: server verification defaults to the Mozilla CA bundle, so a public ACME (Let's Encrypt) certificate is trusted out of the box with no flags at all; use `--ca` for a private CA or `--insecure` for self-signed testing.
+Both clients resolve trust the same way: server verification defaults to the OS verifier (Security.framework on macOS/iOS/tvOS, CryptoAPI on Windows, the distro CA bundle on Linux), so a public ACME (Let's Encrypt) certificate is trusted out of the box with no flags at all, and a CA distrust shipped by the OS vendor applies without rebuilding the client. A Linux host with no CA bundle at all (a `FROM scratch` container, RouterOS) falls back to the Mozilla list compiled into the binary and logs a warning; that list only changes when the binary is rebuilt, so mount a CA bundle (and point `SSL_CERT_FILE` at it) where you can. Use `--ca` for a private CA or `--insecure` for self-signed testing.
 
 ### `server` options
 

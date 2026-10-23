@@ -6,10 +6,12 @@ use bytes::{BufMut, Bytes, BytesMut};
 /// Build the client TLS config both clients share.
 ///
 /// Trust resolves in three steps: `--insecure` disables verification
-/// entirely, `--ca` pins a private root store, and the default is the Mozilla
-/// CA bundle — which includes the ISRG roots that real ACME/Let's Encrypt
-/// certificates chain to, so a public relay verifies with no extra flags and
-/// no platform trust glue (the iOS build has none available).
+/// entirely, `--ca` pins a private root store, and the default is the OS
+/// verifier — so a public ACME/Let's Encrypt relay verifies with no extra
+/// flags, and a CA distrust the OS vendor ships (Apple revokes compromised
+/// intermediates outside any root list) takes effect without rebuilding the
+/// client. Only a host with no system CA store at all (a
+/// FROM-scratch container, RouterOS) falls back to the bundled Mozilla list.
 ///
 /// Shared rather than duplicated because both clients need byte-identical
 /// behavior here, and a trust decision that drifts between two copies is the
@@ -24,20 +26,38 @@ pub fn build_client_tls_config(
             .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
             .with_no_client_auth()
     } else {
-        let mut roots = rustls::RootCertStore::empty();
-        match ca {
+        let builder = rustls::ClientConfig::builder();
+        let builder = match ca {
             Some(path) => {
+                let mut roots = rustls::RootCertStore::empty();
                 let file = std::fs::File::open(path)?;
                 let mut reader = std::io::BufReader::new(file);
                 for cert in rustls_pemfile::certs(&mut reader) {
                     roots.add(cert?)?;
                 }
+                builder.with_root_certificates(roots)
             }
-            None => roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned()),
-        }
-        rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth()
+            // Only the Linux backend can fail here, when the system store is
+            // empty; Apple and Windows consult the OS at handshake time.
+            None => {
+                let provider = builder.crypto_provider().clone();
+                match rustls_platform_verifier::Verifier::new(provider) {
+                    Ok(verifier) => builder
+                        .dangerous()
+                        .with_custom_certificate_verifier(Arc::new(verifier)),
+                    Err(e) => {
+                        log::warn!(
+                            "[client] no system CA store ({e}); falling back to the bundled \
+                             Mozilla CA list, which only changes when this binary is rebuilt"
+                        );
+                        let mut roots = rustls::RootCertStore::empty();
+                        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+                        builder.with_root_certificates(roots)
+                    }
+                }
+            }
+        };
+        builder.with_no_client_auth()
     };
     config.alpn_protocols = vec![b"h3".to_vec()];
     // Allow 0-RTT on reconnect: the rustls session store persists tickets, so a

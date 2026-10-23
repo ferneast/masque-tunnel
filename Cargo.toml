@@ -28,9 +28,15 @@ http = "1"
 # stack. Costs ~1.2 KB on the wire per handshake.
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std", "prefer-post-quantum"] }
 rustls-pemfile = "2"
-# Default TLS trust: the Mozilla CA bundle, so the CONNECT-IP client (incl. iOS)
-# verifies public ACME certificates without platform-specific trust glue.
-webpki-roots = "0.26"
+# Default TLS trust: the OS verifier (Security.framework on Apple, CryptoAPI on
+# Windows, the distro CA bundle on Linux), so a CA distrust the OS vendor pushes
+# reaches the clients without a rebuild. A bundled root list stays frozen at
+# build time: the 2026-10 eMudhra key compromise left every binary built on
+# webpki-roots 1.0.9 trusting the affected root until it was rebuilt.
+rustls-platform-verifier = "0.7"
+# Fallback trust for hosts with no system CA store (FROM-scratch containers,
+# RouterOS). 1.0.10 drops "emSign ECC Root CA - G3".
+webpki-roots = "1.0.10"
 tokio = { version = "1", features = ["net", "sync", "time", "rt-multi-thread", "macros", "signal"] }
 futures-util = "0.3"
 clap = { version = "4", features = ["derive"] }

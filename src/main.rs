@@ -58,7 +58,7 @@ enum Commands {
         auth_token: Option<String>,
 
         /// CA certificate PEM file for server verification. Omit to use the
-        /// Mozilla CA bundle, which trusts public ACME certificates.
+        /// OS trust store, which trusts public ACME certificates.
         #[arg(long)]
         ca: Option<String>,
 
