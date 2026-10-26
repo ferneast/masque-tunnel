@@ -76,7 +76,7 @@ pub async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error +
     server_crypto.send_half_rtt_data = true;
 
     let mut transport = quinn::TransportConfig::default();
-    transport.initial_mtu(1350);
+    transport.initial_mtu(QUIC_INITIAL_MTU);
     transport.datagram_receive_buffer_size(Some(8_000_000));
     transport.datagram_send_buffer_size(8_000_000);
     // Generous enough to outlast a mobile client whose keep-alive timer is not

@@ -376,14 +376,14 @@ async fn shutdown_signal() {
 
 /// Build the quinn client config: TLS trust (system roots by default, custom CA
 /// with `--ca`, or no verification with `--insecure`) plus transport tuning
-/// (optimistic 1350 initial MTU, large datagram buffers, BBR, 30s idle).
+/// (optimistic initial MTU, large datagram buffers, BBR, 30s idle).
 fn build_client_config(
     config: &IpClientConfig,
 ) -> Result<quinn::ClientConfig, Box<dyn std::error::Error + Send + Sync>> {
     let crypto = build_client_tls_config(&config.ca, config.insecure)?;
 
     let mut transport = quinn::TransportConfig::default();
-    transport.initial_mtu(1350);
+    transport.initial_mtu(QUIC_INITIAL_MTU);
     transport.datagram_receive_buffer_size(Some(8_000_000));
     transport.datagram_send_buffer_size(8_000_000);
     // Must match the server's advertised value: the effective idle timeout is the

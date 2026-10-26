@@ -43,7 +43,7 @@ pub async fn run(config: ClientConfig) -> Result<(), Box<dyn std::error::Error +
     let client_crypto = build_client_tls_config(&config.ca, config.insecure)?;
 
     let mut transport = quinn::TransportConfig::default();
-    transport.initial_mtu(1350);
+    transport.initial_mtu(QUIC_INITIAL_MTU);
     transport.datagram_receive_buffer_size(Some(8_000_000));
     transport.datagram_send_buffer_size(8_000_000);
     // Must match the server's advertised value: the effective idle timeout is the

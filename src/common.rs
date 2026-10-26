@@ -166,9 +166,19 @@ pub const CONNECT_UDP_PATH: &str = "/.well-known/masque/udp";
 /// Well-known URI prefix for CONNECT-IP (RFC 9484).
 pub const CONNECT_IP_PATH: &str = "/.well-known/masque/ip";
 
+/// Max UDP payload quinn uses on a path before path MTU discovery raises it.
+/// The smallest value at which a 1280-byte WireGuard MTU fits through
+/// CONNECT-UDP: quinn sizes a DATAGRAM for a worst-case 4-byte packet number
+/// and 8-byte length (38 bytes with the flags byte, 8-byte CID, and 16-byte
+/// tag), the HTTP Datagram adds a quarter stream ID and context ID (2), and
+/// WireGuard wraps the inner packet in 32: 1280 + 32 + 2 + 38 = 1352. Below
+/// this, full-size WireGuard packets are dropped until discovery succeeds, and
+/// for good on a path where its first probe fails.
+pub const QUIC_INITIAL_MTU: u16 = 1352;
+
 /// Largest inner IP packet one HTTP Datagram can carry before we reply with an
 /// ICMP Packet Too Big (RFC 9484 §7.1). Kept below the datagram payload
-/// available at the initial ~1350-byte max UDP payload (leaving room for QUIC,
+/// available at `QUIC_INITIAL_MTU` (leaving room for QUIC,
 /// DATAGRAM-frame, quarter-stream-id, and context-id overhead) and at/above
 /// the IPv6 minimum MTU of 1280.
 pub const TUNNEL_IP_MTU: u32 = 1300;

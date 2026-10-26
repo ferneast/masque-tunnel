@@ -241,7 +241,7 @@ Two things make that persistence easy to get wrong. Files in `/etc/sysctl.d/` ar
 
 To confirm it reached the socket, check the receive buffer of the running server: `sudo ss -ulnpm | grep -A1 :443` should show `rb16777216` and `d0` (no drops), not the default `rb212992`.
 
-QUIC starts with an optimistic 1350-byte MTU and adapts via path MTU discovery. Set the tunneled interface (WireGuard MTU, or the CONNECT-IP `--mtu`) to **1280** so packets fit inside a QUIC DATAGRAM on typical paths; a packet too large for one datagram is answered with an ICMP Packet Too Big rather than dropped silently, but sizing it down avoids the round trip.
+QUIC starts with an optimistic 1352-byte MTU and adapts via path MTU discovery. Set the tunneled interface (WireGuard MTU, or the CONNECT-IP `--mtu`) to **1280** so packets fit inside a QUIC DATAGRAM on typical paths; a packet too large for one datagram is answered with an ICMP Packet Too Big rather than dropped silently, but sizing it down avoids the round trip.
 
 ### systemd Service
 
